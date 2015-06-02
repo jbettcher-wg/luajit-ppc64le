@@ -366,8 +366,9 @@
 #define LJ_ARCH_PPC32ON64	1
 #define LJ_ARCH_NOFFI		1
 #elif LJ_ARCH_BITS == 64
-#error "No support for PPC64"
-#undef LJ_TARGET_PPC
+#define LJ_ARCH_PPC64		1
+#define LJ_TARGET_GC64		1
+#define LJ_ARCH_NOJIT		1	/* NYI */
 #endif
 
 #if _ARCH_PWR7
@@ -543,8 +544,12 @@
 #undef LJ_TARGET_ARM64
 #endif
 #elif LJ_TARGET_PPC
-#if defined(_LITTLE_ENDIAN) && (!defined(_BYTE_ORDER) || (_BYTE_ORDER == _LITTLE_ENDIAN))
+#if !LJ_ARCH_PPC64 && defined(_LITTLE_ENDIAN) && (!defined(_BYTE_ORDER) || (_BYTE_ORDER == _LITTLE_ENDIAN))
 #error "No support for little-endian PPC32"
+#undef LJ_TARGET_PPC
+#endif
+#if LJ_ARCH_PPC64 && LJ_ARCH_ENDIAN == LUAJIT_BE
+#error "No support for big-endian PPC64"
 #undef LJ_TARGET_PPC
 #endif
 #if defined(__NO_FPRS__) && !defined(_SOFT_FLOAT)
