@@ -144,6 +144,12 @@ static void emit_asm_wordreloc(BuildCtx *ctx, uint8_t *p, int n,
     fprintf(ctx->fp, "\t%s %d, %d, " TOCPREFIX "%s\n",
 	    (ins & 1) ? "bcl" : "bc", (ins >> 21) & 31, (ins >> 16) & 31, sym);
   } else if ((ins >> 26) == 18) {
+#if LJ_ARCH_PPC64
+    char *suffix = strchr(sym, '@');
+    if (suffix) {
+      fprintf(ctx->fp, "\tld 12, %s(2)\n", sym);
+    } else
+#endif
     fprintf(ctx->fp, "\t%s " TOCPREFIX "%s\n", (ins & 1) ? "bl" : "b", sym);
   } else {
     fprintf(stderr,
@@ -242,6 +248,10 @@ void emit_asm(BuildCtx *ctx)
   int i, rel;
 
   fprintf(ctx->fp, "\t.file \"buildvm_%s.dasc\"\n", ctx->dasm_arch);
+#if LJ_ARCH_PPC64
+  fprintf(ctx->fp, "\t.abiversion 2\n");
+  fprintf(ctx->fp, "\t.section\t\t\".toc\",\"aw\"\n");
+#endif
   fprintf(ctx->fp, "\t.text\n");
 #if LJ_TARGET_MIPS32 && !LJ_ABI_SOFTFP
   fprintf(ctx->fp, "\t.module fp=32\n");
