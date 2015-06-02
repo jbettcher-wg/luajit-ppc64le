@@ -407,7 +407,25 @@
     goto done; \
   } \
 
-#if LJ_ABI_SOFTFP
+#if LJ_ARCH_PPC64
+/* ELFv2: FP arguments are passed in FPRs, but consume a GPR slot, too.
+** Vararg arguments are always passed in GPRs.
+*/
+#define CCALL_HANDLE_REGARG \
+  if (isva) {  /* Only GPRs are used for vararg arguments. */ \
+    CCALL_HANDLE_GPR \
+  } else if (isfp) {  /* Try to pass argument in FPRs. */ \
+    if (nfpr + 1 <= CCALL_NARG_FPR) { \
+      dp = &cc->fpr[nfpr]; \
+      nfpr += 1; \
+      ngpr += 1;  /* An FPR argument consumes a GPR slot, too. */ \
+      d = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */ \
+      goto done; \
+    } \
+  } else { \
+    CCALL_HANDLE_GPR \
+  }
+#elif LJ_ABI_SOFTFP
 #define CCALL_HANDLE_REGARG  CCALL_HANDLE_GPR
 #else
 #define CCALL_HANDLE_REGARG \
