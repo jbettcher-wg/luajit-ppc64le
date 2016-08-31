@@ -408,8 +408,8 @@
   } \
 
 #if LJ_ARCH_PPC64
-/* ELFv2: FP arguments are passed in FPRs, but consume a GPR slot, too.
-** Vararg arguments are always passed in GPRs.
+/* ELFv2: FP arguments are passed in FPRs, but reserve a GPR or a parameter
+** save area slot, too. Vararg arguments are always passed in GPRs.
 */
 #define CCALL_HANDLE_REGARG \
   if (isva) {  /* Only GPRs are used for vararg arguments. */ \
@@ -418,8 +418,13 @@
     if (nfpr + 1 <= CCALL_NARG_FPR) { \
       dp = &cc->fpr[nfpr]; \
       nfpr += 1; \
-      ngpr += 1;  /* An FPR argument consumes a GPR slot, too. */ \
       d = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */ \
+      if (ngpr + 1 <= maxgpr) \
+	ngpr += 1;  /* Reserve a GPR. */ \
+      else if (nsp + CTSIZE_PTR <= CCALL_SIZE_STACK) \
+	nsp += CTSIZE_PTR;  /* Or reserve a save area slot. */ \
+      else \
+	goto err_nyi;  /* Too many arguments. */ \
       goto done; \
     } \
   } else { \
