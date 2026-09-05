@@ -505,6 +505,7 @@ static void emit_storeofs(ASMState *as, IRIns *ir, Reg r, Reg base, int32_t ofs)
     emit_fai(as, irt_isnum(ir->t) ? PPCI_STFD : PPCI_STFS, r, base, ofs);
 }
 
+#if !LJ_ARCH_PPC64
 /* Emit a compare (for equality) with a constant operand. */
 static void emit_cmpi(ASMState *as, Reg r, int32_t k)
 {
@@ -517,6 +518,7 @@ static void emit_cmpi(ASMState *as, Reg r, int32_t k)
     emit_asi(as, PPCI_XORIS, RID_TMP, r, (k >> 16));
   }
 }
+#endif
 
 /* Add offset to pointer. */
 static void emit_addptr(ASMState *as, Reg r, int32_t ofs)

@@ -496,7 +496,7 @@ local function disass_ins(ctx)
 	end
 	name ..= bo & 1 == (op >> 15) & 1 ? "-" : "+"
       elseif bo & 0x10 == 0 then
-	cn = map_cond[(cond & 3) | ((bo >> 1) & 4)]
+	cn = map_cond[(cond & 3) | ((bo & 8) == 0 ? 4 : 0)]  -- BO 011at: bit 8 set = branch if true
 	if cond > 3 then x = "cr"..(cond >> 2) end
 	name ..= bo & 1 == (op >> 15) & 1 ? "-" : "+"
       end

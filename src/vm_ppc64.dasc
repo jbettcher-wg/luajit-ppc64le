@@ -2620,10 +2620,57 @@ static void build_subroutines(BuildCtx *ctx)
   |.endif
   |
   |// TValue *lj_vm_next(GCtab *t, uint32_t idx)
+  |// CARG1 = t, CARG2 = idx (u32; the upper half may be garbage, D3).
+  |// Returns CRET1 = pointer to a val/key TValue pair (a Node, or the
+  |// trace's spill slots 24/25 at 96(sp)/104(sp), which lj_asm.c reserves
+  |// for this call: SPS_FIRST+4) and CRET2 = the index to continue from
+  |// (the call's IR_HIOP result). Leaf: no frame, the trace's sp is ours.
   |->vm_next:
   |.if JIT
-  |  NYI  // Only reachable from a trace (IRCALL_lj_vm_next); port from
-  |       // vm_arm64.dasc in Phase 3 together with the recorder support.
+  |  lwz CARG3, TAB:CARG1->asize
+  |  ld TMP1, TAB:CARG1->array
+  |  clrldi CARG2, CARG2, 32
+  |1:  // Traverse array part.
+  |  cmplw CARG2, CARG3
+  |  bge >5
+  |  sldi TMP0, CARG2, 3
+  |  ldx TMP0, TMP1, TMP0
+  |  cmpdi TMP0, -1
+  |  addi CARG2, CARG2, 1
+  |  beq <1				// Skip holes in array part.
+  |  std TMP0, 96(sp)			// Value.
+  |  li TMP2, -14			// LJ_TISNUM as the signed 17-bit tag.
+  |  sldi TMP2, TMP2, 47
+  |  addi TMP0, CARG2, -1
+  |  or TMP0, TMP0, TMP2
+  |  std TMP0, 104(sp)			// Key: (LJ_TISNUM<<47)|idx.
+  |  addi CRET1, sp, 96
+  |  blr
+  |
+  |5:  // Traverse hash part.
+  |  lwz TMP2, TAB:CARG1->hmask
+  |  ld TMP1, TAB:CARG1->node
+  |  subf TMP0, CARG3, CARG2		// idx - asize.
+  |  add CARG3, CARG3, TMP2		// lim = asize + hmask.
+  |  mulli TMP0, TMP0, 24		// sizeof(Node).
+  |  add CRET1, TMP1, TMP0
+  |6:
+  |  cmplw CARG2, CARG3
+  |  bgt >9
+  |  ld TMP0, 0(CRET1)			// Node.val (first field).
+  |  cmpdi TMP0, -1
+  |  addi CARG2, CARG2, 1
+  |  bne >4
+  |  addi CRET1, CRET1, 24		// Skip holes in hash part.
+  |  b <6
+  |4:
+  |  blr
+  |
+  |9:  // End of iteration. Set the key to nil (not the value).
+  |  li TMP0, -1
+  |  std TMP0, 104(sp)
+  |  addi CRET1, sp, 96
+  |  blr
   |.endif
   |
   |//-----------------------------------------------------------------------
@@ -4469,8 +4516,15 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
       |    checknum CARG2
       |  bso >6
       |4:
-      |  std CARG1, FORL_IDX*8(RA)
-      |   checknum CARG1
+      |  // CARG1 is the raw, sign-extended int (checknum's get_value). The
+      |  // idx slot is a TValue: store it tagged, as the ppc32 VM's stw of
+      |  // the low word under an intact TISNUM word does. A raw store here
+      |  // was invisible to the interpreter (it re-reads the slot through
+      |  // checknum) but the JIT's SLOAD/snapshots read a TValue: the trace
+      |  // saw tag 0 (a denormal double) or an int guard that always failed.
+      |  clrldi TMP0, CARG1, 32
+      |  or TMP0, TMP0, TISNUM
+      |  std TMP0, FORL_IDX*8(RA)
     } else {
       |  ld CARG3, FORL_STEP*8(RA)
       |    get_oper_type TMP3, CARG3

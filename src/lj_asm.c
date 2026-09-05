@@ -2286,7 +2286,8 @@ static void asm_setup_regsp(ASMState *as)
       }
     case IR_CALLL:
       /* lj_vm_next needs two TValues on the stack. */
-#if LJ_TARGET_X64 && LJ_ABI_WIN
+#if (LJ_TARGET_X64 && LJ_ABI_WIN) || LJ_ARCH_PPC64
+      /* PPC64: slots 24..27 at 96(sp), above the ELFv2 header. */
       if (ir->op2 == IRCALL_lj_vm_next && as->evenspill < SPS_FIRST + 4)
 	as->evenspill = SPS_FIRST + 4;
 #else

@@ -30,8 +30,16 @@ enum {
 
   /* Calling conventions. */
   RID_RET = RID_R3,
+#if LJ_ARCH_PPC64
+  /* Two-register results (IR_HIOP on a call): lj_vm_next returns the
+  ** TValue-pair pointer in r3 and the continuation index in r4.
+  */
+  RID_RETLO = RID_R3,
+  RID_RETHI = RID_R4,
+#else
   RID_RETHI = RID_R3,
   RID_RETLO = RID_R4,
+#endif
   RID_FPRET = RID_F1,
 
   /* These definitions must match with the *.dasc file(s): */
