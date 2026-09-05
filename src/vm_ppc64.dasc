@@ -116,6 +116,11 @@
 |.define TMPD,		TMPD_LO	// base address of TMPD doubleword
 |.define TONUM_D,	TONUM_LO// base address of TONUM doubleword
 |
+|// Scratch doublewords in the ABI-mandated protected zone below sp.
+|// Only usable by leaf helper functions (no stack frame, no calls).
+|.define TMPRZ,		-8(sp)	// Base address, also LSW (little-endian).
+|.define TMPRZ2,	-16(sp)
+|
 |.macro save_, reg
 |  std r..reg, SAVE_GPR_+(reg-14)*8(sp)
 |  stfd f..reg, SAVE_FPR_+(reg-14)*8(sp)
@@ -1063,6 +1068,25 @@ static void build_subroutines(BuildCtx *ctx)
   |  b ->vmeta_binop			// Binop call for compatibility.
 #endif
   |
+  |//-- Bit operator metamethods -------------------------------------------
+  |
+  |->vmeta_bnot:
+  |  mr CARG3, RD
+  |  mr CARG4, RD
+  |  b >1
+  |
+  |->vmeta_bitop:
+  |  mr CARG3, RB
+  |  mr CARG4, RC
+  |1:
+  |  add CARG2, BASE, RA
+  |   std BASE, L->base
+  |  mr CARG1, L
+  |   std PC, SAVE_PC
+  |  decode_OP1 CARG5, INS		// Caveat: CARG5 overlaps INS.
+  |  bl extern lj_meta_bitop  // (lua_State *L, TValue *ra,*rb,*rc, BCReg op)
+  |  b ->cont_nop
+  |
   |//-- Call metamethod ----------------------------------------------------
   |
   |->vmeta_call:			// Resolve and call __call metamethod.
@@ -1219,11 +1243,11 @@ static void build_subroutines(BuildCtx *ctx)
   |   beq ->fff_restv
   |  lwz TMP0, TAB:RB->hmask
   |   li CARG1, LJ_TTAB			// Use metatable as default result.
-  |  ld TMP1, STR:RC->hash
+  |  lwz TMP1, STR:RC->sid
   |   set_oper_type CARG1, CARG1
   |  ld NODE:TMP2, TAB:RB->node
   |  add CARG1, CARG1, TAB:RB
-  |  and TMP1, TMP1, TMP0		// idx = str->hash & tab->hmask
+  |  and TMP1, TMP1, TMP0		// idx = str->sid & tab->hmask
   |  sldi TMP0, TMP1, 5
   |  sldi TMP1, TMP1, 3
   |  sub TMP1, TMP0, TMP1
@@ -1937,7 +1961,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  std L, SBUF:CARG1->L
   |  std BASE, L->base
   |  std PC, SAVE_PC
-  |   std TMP0, SBUF:CARG1->p
+  |   std TMP0, SBUF:CARG1->w
   |  bl extern lj_buf_putstr_ .. name
   |  bl extern lj_buf_tostr
   |  b ->fff_resstr
@@ -2248,6 +2272,57 @@ static void build_subroutines(BuildCtx *ctx)
   |   li CARG1, 0
   |  beqlr
   |  mcrxr cr0			// Clear SO for -2147483648 % -1 and return 0.
+  |  blr
+  |
+  |//-----------------------------------------------------------------------
+  |//-- Number conversion functions ----------------------------------------
+  |//-----------------------------------------------------------------------
+  |
+  |// int64_t lj_vm_num2int_check(double x)
+  |->vm_num2int_check:
+  |  fctiwz f0, FARG1
+  |  stfd f0, TMPRZ
+  |  lwz CRET1, TMPRZ			// Zero-extended int32_t result.
+  |  extsw TMP1, CRET1
+  |  std TMP1, TMPRZ2
+  |  lfd f0, TMPRZ2
+  |  fcfid f0, f0			// Convert back and check for equality.
+  |  fcmpu cr0, f0, FARG1
+  |  beqlr				// Exact conversion (-0 is ok, too)?
+  |  lus CRET1, 0x8000
+  |  rldicr CRET1, CRET1, 32, 32	// Return 0x8000000080000000 on failure.
+  |  blr
+  |
+  |// int64_t lj_vm_num2i64(double x)
+  |->vm_num2i64:
+  |  fctidz f0, FARG1
+  |  stfd f0, TMPRZ
+  |  ld CRET1, TMPRZ
+  |  blr
+  |
+  |// uint64_t lj_vm_num2u64(double x)
+  |->vm_num2u64:
+  |  fctidz f0, FARG1
+  |   fctiduz f2, FARG1
+  |  stfd f0, TMPRZ
+  |   stfd f2, TMPRZ2
+  |  li TMP1, -1
+  |  ld CRET1, TMPRZ
+  |   ld TMP2, TMPRZ2
+  |  rldicl TMP1, TMP1, 0, 1		// TMP1 = INT64_MAX.
+  |  cmpd CRET1, TMP1
+  |  bnelr				// In signed range: return the i64 result.
+  |  mr CRET1, TMP2			// Otherwise return the u64 result.
+  |  blr
+  |
+  |// int32_t lj_vm_tobit(double x)
+  |->vm_tobit:
+  |  lus TMP1, 0x59c0			// 2^52 + 2^51 (float).
+  |  std TMP1, TMPRZ
+  |  lfs FARG2, TMPRZ
+  |  fadd FARG1, FARG1, FARG2
+  |  stfd FARG1, TMPRZ
+  |  lwa CRET1, TMPRZ			// The LSW holds the result.
   |  blr
   |
   |//-----------------------------------------------------------------------
@@ -3045,6 +3120,56 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  stfdx f0, BASE, RA
     |  ins_next2
     break;
+  /* -- Bit ops ----------------------------------------------------------- */
+
+  case BC_BNOT:
+    |  // RA = dst*8, RD = src*8
+    |  ldux CARG1, RD, BASE		// RD is used in vmeta_bnot.
+    |  checknum CARG1
+    |  bne ->vmeta_bnot
+    |  not CARG1, CARG1
+    |7:
+    |  ins_next1
+    |  rldicl CARG1, CARG1, 0, 32	// Clear the high order 32 bits.
+    |  add CARG1, CARG1, TISNUM
+    |  stdx CARG1, RA, BASE
+    |  ins_next2
+    break;
+
+    |.macro ins_bitop, ins, shmod
+    |  // RA = dst*8, RB = src1*8, RC = src2*8
+    |  ldux CARG1, RB, BASE		// RB is used in vmeta_bitop.
+    |   ldux CARG2, RC, BASE		// RC is used in vmeta_bitop.
+    |  checknum cr0, CARG1
+    |   checknum cr1, CARG2
+    |  bne ->vmeta_bitop
+    |   bne cr1, ->vmeta_bitop
+    |.if shmod == 1
+    |  rlwinm CARG2, CARG2, 0, 27, 31	// Mask shift count to 5 bits.
+    |.endif
+    |  ins CARG1, CARG1, CARG2
+    |  b <7
+    |.endmacro
+
+  case BC_BAND:
+    |  ins_bitop and, 0
+    break;
+  case BC_BOR:
+    |  ins_bitop or, 0
+    break;
+  case BC_BXOR:
+    |  ins_bitop xor, 0
+    break;
+  case BC_BSHL:
+    |  ins_bitop slw, 1
+    break;
+  case BC_BSHR:
+    |  ins_bitop srw, 1
+    break;
+  case BC_BSAR:
+    |  ins_bitop sraw, 1
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -3359,9 +3484,9 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |->BC_TGETS_Z:
     |  // TAB:RB = GCtab *, STR:RC = GCstr *, RA = dst*8
     |  lwz TMP0, TAB:RB->hmask
-    |  lwz TMP1, STR:RC->hash
+    |  lwz TMP1, STR:RC->sid
     |  ld NODE:TMP2, TAB:RB->node
-    |  and TMP1, TMP1, TMP0		// idx = str->hash & tab->hmask
+    |  and TMP1, TMP1, TMP0		// idx = str->sid & tab->hmask
     |  sldi TMP0, TMP1, 5
     |  sldi TMP1, TMP1, 3
     |  sub TMP1, TMP0, TMP1
@@ -3493,10 +3618,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |->BC_TSETS_Z:
     |  // TAB:RB = GCtab *, STR:RC = GCstr *, RA = src*8
     |  lwz TMP0, TAB:RB->hmask
-    |  lwz TMP1, STR:RC->hash
+    |  lwz TMP1, STR:RC->sid
     |  ld NODE:TMP2, TAB:RB->node
     |    stb ZERO, TAB:RB->nomm		// Clear metamethod cache.
-    |  and TMP1, TMP1, TMP0		// idx = str->hash & tab->hmask
+    |  and TMP1, TMP1, TMP0		// idx = str->sid & tab->hmask
     |    lfdx f14, BASE, RA
     |  sldi TMP0, TMP1, 5
     |  sldi TMP1, TMP1, 3
@@ -3765,6 +3890,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |.if JIT
     |  // NYI: add hotloop, record BC_ITERN.
     |.endif
+    |->vm_IITERN:
     |  add RA, BASE, RA
     |  ld TAB:RB, -16(RA)
     |  clear_field TAB:RB
