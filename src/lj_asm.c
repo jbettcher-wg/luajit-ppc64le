@@ -97,6 +97,9 @@ typedef struct ASMState {
 #if LJ_TARGET_PPC || LJ_TARGET_ARM64
   MCode *mcexit;	/* Pointer to exit stubs. */
 #endif
+#if LJ_ARCH_PPC64
+  int xerclr;		/* Trace has a sticky-SO guard: head clears XER. */
+#endif
 
 #ifdef LUAJIT_RANDOM_RA
   /* Randomize register allocation. OK for fuzz testing, not for production. */

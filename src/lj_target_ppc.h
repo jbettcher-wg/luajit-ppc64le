@@ -207,6 +207,20 @@ static LJ_AINLINE uint32_t *exitstub_trace_addr_(uint32_t *p, uint32_t exitno)
 #define PPCF_M6(n)	((((n) & 31) << 6) | ((n) & 32))
 #define PPCF_Y		0x00200000
 #define PPCF_DOT	0x00000001
+/* CR field selectors: PPCF_CRF for the BF field of cmp/mcrxrx (bits 23..25),
+** PPCF_CRBI for the upper three bits of a bc instruction's BI field
+** (BI = 4*crf + bit; PPCF_CC supplies the bit and the BO true/false sense).
+*/
+#define PPCF_CRF(crf)	((crf) << 23)
+#define PPCF_CRBI(crf)	((crf) << 18)
+
+/* CR field assignment for trace code (single source, R13). Every compare,
+** every guard and the POWER8 sticky-SO overflow guard use cr0; the ISA 3.0
+** overflow guard projects XER into cr7 with mcrxrx (LT=OV GT=OV32 EQ=CA
+** SO=CA32) and branches on GT. cr1-cr6 are unused by the backend.
+*/
+#define PPC_CRF_CMP	0
+#define PPC_CRF_OV	7
 
 typedef enum PPCIns {
   /* Integer instructions. */

@@ -180,6 +180,24 @@ static MCode *asm_exitstub_addr(ASMState *as, ExitNo exitno)
 }
 
 /* Emit conditional branch to exit for guard. */
+#if LJ_ARCH_PPC64
+/* Emit conditional branch to exit for guard, testing bit cc of CR field
+** crf (PPC_CRF_CMP for compares, PPC_CRF_OV for the mcrxrx projection).
+*/
+static void asm_guardcr(ASMState *as, int crf, PPCCC cc)
+{
+  MCode *target = asm_exitstub_addr(as, as->snapno);
+  MCode *p = as->mcp;
+  if (LJ_UNLIKELY(p == as->invmcp)) {
+    as->loopinv = 1;
+    *p = PPCI_B | (((target-p) & 0x00ffffffu) << 2);
+    emit_condbranch_crf(as, PPCI_BC, crf, cc^4, p);
+    return;
+  }
+  emit_condbranch_crf(as, PPCI_BC, crf, cc, target);
+}
+#define asm_guardcc(as, cc)	asm_guardcr(as, PPC_CRF_CMP, (cc))
+#else
 static void asm_guardcc(ASMState *as, PPCCC cc)
 {
   MCode *target = asm_exitstub_addr(as, as->snapno);
@@ -192,6 +210,7 @@ static void asm_guardcc(ASMState *as, PPCCC cc)
   }
   emit_condbranch(as, PPCI_BC, cc, target);
 }
+#endif
 
 /* -- Operand fusion ------------------------------------------------------ */
 
@@ -818,9 +837,25 @@ static void asm_conv(ASMState *as, IRIns *ir)
       Reg dest = ra_dest(as, ir, RSET_GPR);
       Reg left = ra_alloc1(as, lref, RSET_FPR);
       Reg tmp = ra_scratch(as, rset_exclude(RSET_FPR, left));
-      if (irt_isi64(ir->t) || irt_isu64(ir->t)) {
+      if (irt_isu64(ir->t)) {
+	/* num -> u64 as ->vm_num2u64 and x64 do it: the signed truncation
+	** (fctidz) unless it saturated to INT64_MAX (x >= 2^63), then the
+	** unsigned one. Negative inputs wrap, NaN gives 2^63; a plain
+	** fctiduz (arm64's fcvtzu) gives 0 for both and disagrees with the
+	** interpreter of this port. The C cast is undefined for these.
+	*/
+	Reg gtmp = ra_scratch(as, rset_exclude(RSET_GPR, dest));
+	emit_isel(as, dest, gtmp, dest, 4*PPC_CRF_CMP + (CC_EQ & 3));
+	emit_tab(as, PPCI_CMPD, PPC_CRF_CMP, dest, RID_TMP);
+	emit_clrldi(as, RID_TMP, RID_TMP, 1);  /* r0 = INT64_MAX */
+	emit_ti(as, PPCI_LI, RID_TMP, -1);
+	emit_mfvsrd(as, gtmp, tmp);
+	emit_fb(as, PPCI_FCTIDUZ, tmp, left);
 	emit_mfvsrd(as, dest, tmp);
-	emit_fb(as, irt_isu64(ir->t) ? PPCI_FCTIDUZ : PPCI_FCTIDZ, tmp, left);
+	emit_fb(as, PPCI_FCTIDZ, tmp, left);
+      } else if (irt_isi64(ir->t)) {
+	emit_mfvsrd(as, dest, tmp);
+	emit_fb(as, PPCI_FCTIDZ, tmp, left);
       } else if (irt_isu32(ir->t)) {
 	/* u32 = low word of the truncated int64 (wraps like x64/mips64). */
 	emit_mfvsrwz(as, dest, tmp);
@@ -2290,6 +2325,23 @@ static void asm_fpunary(ASMState *as, IRIns *ir, PPCIns pi)
   emit_fb(as, pi, dest, left);
 }
 
+#if LJ_ARCH_PPC64
+static void asm_fpmath(ASMState *as, IRIns *ir)
+{
+  if (ir->op2 <= IRFPM_TRUNC) {
+    /* frim/frip/friz (ISA 2.02+): IEEE round-to-integer in the FPR, the
+    ** same result as C floor/ceil/trunc for every input incl. NaN, +-0,
+    ** +-inf and |x| >= 2^52. No call, no memory temp.
+    */
+    asm_fpunary(as, ir, ir->op2 == IRFPM_FLOOR ? PPCI_FRIM :
+			ir->op2 == IRFPM_CEIL ? PPCI_FRIP : PPCI_FRIZ);
+  } else if (ir->op2 == IRFPM_SQRT && (as->flags & JIT_F_SQRT)) {
+    asm_fpunary(as, ir, PPCI_FSQRT);
+  } else {
+    asm_callid(as, ir, IRCALL_lj_vm_floor + ir->op2);
+  }
+}
+#else
 static void asm_fpmath(ASMState *as, IRIns *ir)
 {
   if (ir->op2 == IRFPM_SQRT && (as->flags & JIT_F_SQRT))
@@ -2297,6 +2349,7 @@ static void asm_fpmath(ASMState *as, IRIns *ir)
   else
     asm_callid(as, ir, IRCALL_lj_vm_floor + ir->op2);
 }
+#endif
 #endif
 
 #if LJ_ARCH_PPC64
@@ -2432,6 +2485,30 @@ static void asm_sub(ASMState *as, IRIns *ir)
 }
 #endif
 
+#if LJ_ARCH_PPC64
+static void asm_mul(ASMState *as, IRIns *ir)
+{
+  if (irt_isnum(ir->t)) {
+    asm_fparith(as, ir, PPCI_FMUL);
+  } else {
+    /* mullw is the smull analogue: the 64-bit product of the low words,
+    ** independent of the upper halves (D3, arith32.c); mulli likewise.
+    ** 64-bit IR types (FFI) use mulld. No CR0 fusion (C21).
+    */
+    Reg dest = ra_dest(as, ir, RSET_GPR);
+    Reg right, left = ra_hintalloc(as, ir->op1, dest, RSET_GPR);
+    if (irref_isk(ir->op2)) {
+      intptr_t k = get_kval(as, ir->op2);
+      if (checki16(k)) {
+	emit_tai(as, PPCI_MULLI, dest, left, (int32_t)k);
+	return;
+      }
+    }
+    right = ra_alloc1(as, ir->op2, rset_exclude(RSET_GPR, left));
+    emit_tab(as, irt_is64(ir->t) ? PPCI_MULLD : PPCI_MULLW, dest, left, right);
+  }
+}
+#else
 static void asm_mul(ASMState *as, IRIns *ir)
 {
 #if !LJ_SOFTFP
@@ -2460,9 +2537,23 @@ static void asm_mul(ASMState *as, IRIns *ir)
     emit_tab(as, pi, dest, left, right);
   }
 }
+#endif
 
 #define asm_fpdiv(as, ir)	asm_fparith(as, ir, PPCI_FDIV)
 
+#if LJ_ARCH_PPC64
+static void asm_neg(ASMState *as, IRIns *ir)
+{
+  if (irt_isnum(ir->t)) {
+    asm_fpunary(as, ir, PPCI_FNEG);
+  } else {
+    /* neg is width-agnostic: the low 32 bits of -x depend on x's low 32. */
+    Reg dest = ra_dest(as, ir, RSET_GPR);
+    Reg left = ra_hintalloc(as, ir->op1, dest, RSET_GPR);
+    emit_tab(as, PPCI_NEG, dest, left, 0);
+  }
+}
+#else
 static void asm_neg(ASMState *as, IRIns *ir)
 {
 #if !LJ_SOFTFP
@@ -2483,9 +2574,82 @@ static void asm_neg(ASMState *as, IRIns *ir)
     emit_tab(as, pi, dest, left, 0);
   }
 }
+#endif
 
 #define asm_abs(as, ir)		asm_fpunary(as, ir, PPCI_FABS)
 
+#if LJ_ARCH_PPC64
+/* Overflow-checked 32-bit add/sub/mul (IR_ADDOV/SUBOV/MULOV), D5/3.7.
+**
+** ISA 3.0 (JIT_F_ISA30, the default on POWER9):
+**   addo   d, a, b        (subfo d, b, a / mullwo d, a, b)
+**   mcrxrx cr7            cr7: LT=OV GT=OV32 EQ=CA SO=CA32
+**   bgt    cr7 -> exit
+** OV32 is computed from the low words alone, so the tag garbage in the
+** upper halves of IR ints (D3) cannot false-overflow -- the handbook's
+** arith32.c shows add+extsw+cmpd is wrong on 5 of 8 such rows. OV/OV32 are
+** rewritten by every OE=1 instruction: nothing is sticky, nothing is
+** cleared. Reading LT (the 64-bit OV) here is the named control
+** (LJ_TEST_BREAK_OVBIT): 2^31-1 + 1 then wraps silently.
+**
+** POWER8 (ISA 2.07, the floor, LUAJIT_PPC_ISA30=0 on this box):
+**   sldi   r0,  a, 32
+**   sldi   tmp, b, 32
+**   addo.  r0, r0, tmp    64-bit overflow of the shifted words == 32-bit
+**   add    d,  a, b       overflow of a+b; cr0.SO <- XER.SO
+**   bso    -> exit
+** cr0.SO is the *sticky* XER.SO, so XER must be zero when the trace is
+** entered: the trace head clears it (as->xerclr, C9) at 37.5 ns per entry
+** (C1) -- only traces that contain such a guard pay, and only on this
+** path. mullwo. needs no shifts (mullw sign-interprets the low words).
+** LJ_TEST_BREAK_P8OV drops the shifts: the 64-bit add then never
+** overflows and the same rows wrap.
+*/
+static void asm_arithov(ASMState *as, IRIns *ir, PPCIns pi)
+{
+  Reg dest, left, right;
+  lj_assertA(!irt_is64(ir->t), "bad usage");
+  if ((as->flags & JIT_F_ISA30)) {
+#ifdef LJ_TEST_BREAK_OVBIT
+    asm_guardcr(as, PPC_CRF_OV, CC_LT);
+#else
+    asm_guardcr(as, PPC_CRF_OV, CC_GT);
+#endif
+    *--as->mcp = PPCI_MCRXRX | PPCF_CRF(PPC_CRF_OV);
+    dest = ra_dest(as, ir, RSET_GPR);
+    left = ra_alloc2(as, ir, RSET_GPR);
+    right = (left >> 8); left &= 255;
+    if (pi == PPCI_SUBFO) { Reg tmp = left; left = right; right = tmp; }
+    emit_tab(as, pi, dest, left, right);
+  } else {
+    as->xerclr = 1;
+    asm_guardcc(as, CC_SO);
+    dest = ra_dest(as, ir, RSET_GPR);
+    left = ra_alloc2(as, ir, RSET_GPR);
+    right = (left >> 8); left &= 255;
+    if (pi == PPCI_MULLWO) {
+      emit_tab(as, PPCI_MULLWO|PPCF_DOT, dest, left, right);
+    } else {
+      Reg tmp = ra_scratch(as, rset_exclude(rset_exclude(rset_exclude(RSET_GPR,
+					    dest), left), right));
+      if (pi == PPCI_SUBFO) {
+	emit_tab(as, PPCI_SUBF, dest, right, left);  /* left - right */
+	emit_tab(as, PPCI_SUBFO|PPCF_DOT, RID_TMP, tmp, RID_TMP);
+      } else {
+	emit_tab(as, PPCI_ADD, dest, left, right);
+	emit_tab(as, PPCI_ADDO|PPCF_DOT, RID_TMP, RID_TMP, tmp);
+      }
+#ifdef LJ_TEST_BREAK_P8OV
+      emit_mr(as, tmp, right);
+      emit_mr(as, RID_TMP, left);
+#else
+      emit_sldi(as, tmp, right, 32);
+      emit_sldi(as, RID_TMP, left, 32);
+#endif
+    }
+  }
+}
+#else
 static void asm_arithov(ASMState *as, IRIns *ir, PPCIns pi)
 {
   Reg dest, left, right;
@@ -2500,6 +2664,7 @@ static void asm_arithov(ASMState *as, IRIns *ir, PPCIns pi)
   if (pi == PPCI_SUBFO) { Reg tmp = left; left = right; right = tmp; }
   emit_tab(as, pi|PPCF_DOT, dest, left, right);
 }
+#endif
 
 #define asm_addov(as, ir)	asm_arithov(as, ir, PPCI_ADDO)
 #define asm_subov(as, ir)	asm_arithov(as, ir, PPCI_SUBFO)
@@ -2584,6 +2749,29 @@ static void asm_neg64(ASMState *as, IRIns *ir)
 }
 #endif
 
+#if LJ_ARCH_PPC64
+static void asm_bnot(ASMState *as, IRIns *ir)
+{
+  Reg dest, left, right;
+  PPCIns pi = PPCI_NOR;  /* nor/nand/eqv are width-agnostic. */
+  dest = ra_dest(as, ir, RSET_GPR);
+  if (mayfuse(as, ir->op1)) {
+    IRIns *irl = IR(ir->op1);
+    if (irl->o == IR_BAND)
+      pi = PPCI_NAND;
+    else if (irl->o == IR_BXOR)
+      pi = PPCI_EQV;
+    else if (irl->o != IR_BOR)
+      goto nofuse;
+    left = ra_hintalloc(as, irl->op1, dest, RSET_GPR);
+    right = ra_alloc1(as, irl->op2, rset_exclude(RSET_GPR, left));
+  } else {
+nofuse:
+    left = right = ra_hintalloc(as, ir->op1, dest, RSET_GPR);
+  }
+  emit_asb(as, pi, dest, left, right);
+}
+#else
 static void asm_bnot(ASMState *as, IRIns *ir)
 {
   Reg dest, left, right;
@@ -2610,7 +2798,46 @@ nofuse:
   }
   emit_asb(as, pi, dest, left, right);
 }
+#endif
 
+#if LJ_ARCH_PPC64
+static void asm_bswap(ASMState *as, IRIns *ir)
+{
+  Reg dest = ra_dest(as, ir, RSET_GPR);
+  IRIns *irx;
+  int is64 = irt_is64(ir->t);
+  if (mayfuse(as, ir->op1) && (irx = IR(ir->op1))->o == IR_XLOAD &&
+      ra_noreg(irx->r) &&
+      (is64 ? (irt_isi64(irx->t) || irt_isu64(irx->t)) :
+	      (irt_isint(irx->t) || irt_isu32(irx->t)))) {
+    /* Fuse BSWAP with XLOAD to lwbrx/ldbrx. */
+    asm_fusexrefx(as, is64 ? PPCI_LDBRX : PPCI_LWBRX, dest, irx->op1, RSET_GPR);
+  } else {
+    Reg left = ra_alloc1(as, ir->op1, RSET_GPR);
+    if (is64) {
+      /* No register byte-reverse before POWER10: go through the LR save
+      ** doubleword (SPOFS_TMP, dead between calls): addi r0,sp,16;
+      ** stdbrx left,0,r0; ld dest,16(sp).
+      */
+      emit_tai(as, PPCI_LD, dest, RID_SP, SPOFS_TMP);
+      emit_tab(as, PPCI_STDBRX, left, 0, RID_TMP);
+      emit_tai(as, PPCI_ADDI, RID_TMP, RID_SP, SPOFS_TMP);
+    } else {
+      /* rotlwi/rlwimi work on the low word and leave a zero-extended
+      ** result: garbage-tolerant either way (D3).
+      */
+      Reg tmp = dest;
+      if (tmp == left) {
+	tmp = RID_TMP;
+	emit_mr(as, dest, RID_TMP);
+      }
+      emit_rot(as, PPCI_RLWIMI, tmp, left, 24, 16, 23);
+      emit_rot(as, PPCI_RLWIMI, tmp, left, 24, 0, 7);
+      emit_rotlwi(as, tmp, left, 8);
+    }
+  }
+}
+#else
 static void asm_bswap(ASMState *as, IRIns *ir)
 {
   Reg dest = ra_dest(as, ir, RSET_GPR);
@@ -2631,6 +2858,7 @@ static void asm_bswap(ASMState *as, IRIns *ir)
     emit_rotlwi(as, tmp, left, 8);
   }
 }
+#endif
 
 /* Fuse BAND with contiguous bitmask and a shift to rlwinm. */
 static void asm_fuseandsh(ASMState *as, PPCIns pi, int32_t mask, IRRef ref)
@@ -2662,6 +2890,73 @@ nofuse:
   *--as->mcp = pi | PPCF_T(left);
 }
 
+#if LJ_ARCH_PPC64
+static void asm_band(ASMState *as, IRIns *ir)
+{
+  Reg dest, left, right;
+  IRRef lref = ir->op1;
+  IRRef op2;
+  int is64 = irt_is64(ir->t);
+  dest = ra_dest(as, ir, RSET_GPR);
+  if (irref_isk(ir->op2)) {
+    intptr_t k = get_kval(as, ir->op2);
+    uint64_t u = is64 ? (uint64_t)k : (uint64_t)(uint32_t)k;
+    if (!is64 && (uint32_t)u) {
+      /* 32 bit: a contiguous (or wrapped) bitmask folds into rlwinm,
+      ** possibly together with a shift of the operand (asm_fuseandsh).
+      */
+      uint32_t s1 = lj_ffs((uint32_t)u);
+      uint32_t k1 = ((uint32_t)u >> s1);
+      if ((k1 & (k1+1)) == 0) {
+	asm_fuseandsh(as, PPCI_RLWINM | PPCF_A(dest) |
+			  PPCF_MB(31-lj_fls((uint32_t)u)) | PPCF_ME(31-s1),
+			  (int32_t)u, lref);
+	return;
+      }
+      if (~(uint32_t)u) {
+	uint32_t s2 = lj_ffs(~(uint32_t)u);
+	uint32_t k2 = (~(uint32_t)u >> s2);
+	if ((k2 & (k2+1)) == 0) {
+	  asm_fuseandsh(as, PPCI_RLWINM | PPCF_A(dest) |
+			    PPCF_MB(32-s2) | PPCF_ME(30-lj_fls(~(uint32_t)u)),
+			    (int32_t)u, lref);
+	  return;
+	}
+      }
+    }
+    /* andi./andis. zero everything above the 16 mask bits: right for
+    ** both widths. Their CR0 write is dead (no CR0 fusion on PPC64).
+    */
+    if ((u >> 16) == 0) {
+      left = ra_alloc1(as, lref, RSET_GPR);
+      emit_asi(as, PPCI_ANDIDOT, dest, left, (int32_t)u);
+      return;
+    } else if ((u & 0xffff) == 0 && (u >> 32) == 0) {
+      left = ra_alloc1(as, lref, RSET_GPR);
+      emit_asi(as, PPCI_ANDISDOT, dest, left, (int32_t)(u >> 16));
+      return;
+    } else if (is64 && (u & (u+1)) == 0) {  /* Low ones: clrldi. */
+      left = ra_alloc1(as, lref, RSET_GPR);
+      emit_clrldi(as, dest, left, 63 - (int32_t)lj_fls64(u));
+      return;
+    } else if (is64 && ~u != 0 && ((~u) & (~u+1)) == 0) {  /* High ones. */
+      left = ra_alloc1(as, lref, RSET_GPR);
+      emit_clrrdi(as, dest, left, (int32_t)lj_fls64(~u) + 1);
+      return;
+    }
+  }
+  op2 = ir->op2;
+  if (mayfuse(as, op2) && IR(op2)->o == IR_BNOT && ra_noreg(IR(op2)->r)) {
+    left = ra_hintalloc(as, lref, dest, RSET_GPR);
+    right = ra_alloc1(as, IR(op2)->op1, rset_exclude(RSET_GPR, left));
+    emit_asb(as, PPCI_ANDC, dest, left, right);
+    return;
+  }
+  left = ra_hintalloc(as, lref, dest, RSET_GPR);
+  right = ra_alloc1(as, op2, rset_exclude(RSET_GPR, left));
+  emit_asb(as, PPCI_AND, dest, left, right);
+}
+#else
 static void asm_band(ASMState *as, IRIns *ir)
 {
   Reg dest, left, right;
@@ -2716,7 +3011,36 @@ static void asm_band(ASMState *as, IRIns *ir)
   right = ra_alloc1(as, op2, rset_exclude(RSET_GPR, left));
   emit_asb(as, PPCI_AND ^ dot, dest, left, right);
 }
+#endif
 
+#if LJ_ARCH_PPC64
+static void asm_bitop(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pik)
+{
+  Reg dest = ra_dest(as, ir, RSET_GPR);
+  Reg right, left = ra_hintalloc(as, ir->op1, dest, RSET_GPR);
+  if (irref_isk(ir->op2)) {
+    intptr_t k = get_kval(as, ir->op2);
+    /* ori/oris/xori/xoris take zero-extended 16-bit immediates and touch
+    ** only the low 32 bits: usable for any constant below 2^32 (as the
+    ** 32-bit pattern for 32-bit IR types, whatever its sign).
+    */
+    uint64_t u = irt_is64(ir->t) ? (uint64_t)k : (uint64_t)(uint32_t)k;
+    if ((u >> 32) == 0) {
+      Reg tmp = left;
+      if ((u >> 16) == 0 || (u & 0xffff) == 0 || (tmp = dest, !as->sectref)) {
+	if ((u >> 16) != 0) {
+	  emit_asi(as, pik ^ (PPCI_ORI ^ PPCI_ORIS), dest, tmp, (int32_t)(u >> 16));
+	  if ((u & 0xffff) == 0) return;
+	}
+	emit_asi(as, pik, dest, left, (int32_t)(u & 0xffff));
+	return;
+      }
+    }
+  }
+  right = ra_alloc1(as, ir->op2, rset_exclude(RSET_GPR, left));
+  emit_asb(as, pi, dest, left, right);
+}
+#else
 static void asm_bitop(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pik)
 {
   Reg dest = ra_dest(as, ir, RSET_GPR);
@@ -2742,10 +3066,72 @@ static void asm_bitop(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pik)
   right = ra_alloc1(as, ir->op2, rset_exclude(RSET_GPR, left));
   emit_asb(as, pi, dest, left, right);
 }
+#endif
 
 #define asm_bor(as, ir)		asm_bitop(as, ir, PPCI_OR, PPCI_ORI)
 #define asm_bxor(as, ir)	asm_bitop(as, ir, PPCI_XOR, PPCI_XORI)
 
+#if LJ_ARCH_PPC64
+/* Shifts. 32 bit: slw/srw/sraw and their rlwinm/srawi immediate forms use
+** the low word and leave a zero- or sign-extended result (D3). Counts are
+** masked by the recorder (LJ_TARGET_MASKSHIFT 0: BAND 31 / BAND 63), which
+** slw/sld require -- a count >= 32/64 yields zero, not a masked shift.
+** 64 bit (FFI): sld/srd/srad/rldcl and rldicr/rldicl/sradi.
+*/
+static void asm_bitshift(ASMState *as, IRIns *ir, IROp op)
+{
+  Reg dest = ra_dest(as, ir, RSET_GPR);
+  Reg left = ra_alloc1(as, ir->op1, RSET_GPR);
+  if (irt_is64(ir->t)) {
+    if (irref_isk(ir->op2)) {  /* Constant shifts. */
+      int32_t sh = (int32_t)(get_kval(as, ir->op2) & 63);
+      switch (op) {
+      case IR_BSHL: emit_rotd(as, PPCI_RLDICR, dest, left, sh, 63-sh); break;
+      case IR_BSHR: emit_rotd(as, PPCI_RLDICL, dest, left, (64-sh)&63, sh); break;
+      case IR_BSAR: emit_sradi(as, dest, left, sh); break;
+      default: emit_rotd(as, PPCI_RLDICL, dest, left, sh, 0); break;  /* rotldi */
+      }
+    } else {
+      Reg right = ra_alloc1(as, ir->op2, rset_exclude(RSET_GPR, left));
+      switch (op) {
+      case IR_BSHL: emit_asb(as, PPCI_SLD, dest, left, right); break;
+      case IR_BSHR: emit_asb(as, PPCI_SRD, dest, left, right); break;
+      case IR_BSAR: emit_asb(as, PPCI_SRAD, dest, left, right); break;
+      default:  /* rotld = rldcl dest,left,right,0 */
+	*--as->mcp = PPCI_RLDCL | PPCF_T(left) | PPCF_A(dest) | PPCF_B(right) |
+		     PPCF_M6(0);
+	break;
+      }
+    }
+  } else {
+    if (irref_isk(ir->op2)) {  /* Constant shifts. */
+      int32_t sh = (IR(ir->op2)->i & 31);
+      switch (op) {
+      case IR_BSHL: emit_rot(as, PPCI_RLWINM, dest, left, sh, 0, 31-sh); break;
+      case IR_BSHR: emit_rot(as, PPCI_RLWINM, dest, left, (32-sh)&31, sh, 31); break;
+      case IR_BSAR: emit_asb(as, PPCI_SRAWI, dest, left, sh); break;
+      default: emit_rot(as, PPCI_RLWINM, dest, left, sh, 0, 31); break;  /* rotlwi */
+      }
+    } else {
+      Reg right = ra_alloc1(as, ir->op2, rset_exclude(RSET_GPR, left));
+      switch (op) {
+      case IR_BSHL: emit_asb(as, PPCI_SLW, dest, left, right); break;
+      case IR_BSHR: emit_asb(as, PPCI_SRW, dest, left, right); break;
+      case IR_BSAR: emit_asb(as, PPCI_SRAW, dest, left, right); break;
+      default:  /* rotlw = rlwnm dest,left,right,0,31 */
+	emit_asb(as, PPCI_RLWNM|PPCF_MB(0)|PPCF_ME(31), dest, left, right);
+	break;
+      }
+    }
+  }
+}
+
+#define asm_bshl(as, ir)	asm_bitshift(as, ir, IR_BSHL)
+#define asm_bshr(as, ir)	asm_bitshift(as, ir, IR_BSHR)
+#define asm_bsar(as, ir)	asm_bitshift(as, ir, IR_BSAR)
+#define asm_brol(as, ir)	asm_bitshift(as, ir, IR_BROL)
+#define asm_bror(as, ir)	lj_assertA(0, "unexpected BROR")
+#else
 static void asm_bitshift(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pik)
 {
   Reg dest, left;
@@ -2778,6 +3164,7 @@ static void asm_bitshift(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pik)
   asm_bitshift(as, ir, PPCI_RLWNM|PPCF_MB(0)|PPCF_ME(31), \
 		       PPCI_RLWINM|PPCF_MB(0)|PPCF_ME(31))
 #define asm_bror(as, ir)	lj_assertA(0, "unexpected BROR")
+#endif
 
 #if LJ_SOFTFP
 static void asm_sfpmin_max(ASMState *as, IRIns *ir)
@@ -2810,6 +3197,43 @@ static void asm_sfpmin_max(ASMState *as, IRIns *ir)
 }
 #endif
 
+#if LJ_ARCH_PPC64
+/* IR_MIN/IR_MAX are defined by the fold (lj_vm_foldarith): x < y ? x : y
+** and x > y ? x : y, so a NaN in either operand and an equal pair (+0/-0)
+** both yield the *right* operand. The ppc32 fsub+fsel form yields the left
+** one on NaN and the wrong zero for max, so it is replaced by fcmpu and a
+** branch (a bge/ble after fcmpu fires on unordered, which is exactly what
+** is wanted here: NaN -> right). Integers: cmpw + isel.
+*/
+static void asm_min_max(ASMState *as, IRIns *ir, int ismax)
+{
+  if (irt_isnum(ir->t)) {
+    Reg dest = ra_dest(as, ir, RSET_FPR);
+    Reg right, left = ra_alloc2(as, ir, RSET_FPR);
+    MCLabel l_end;
+    right = (left >> 8); left &= 255;
+    l_end = emit_label(as);
+    if (dest == left) {
+      /* fcmpu; b<lt|gt> l_end; fmr dest,right; l_end: */
+      emit_fb(as, PPCI_FMR, dest, right);
+      emit_condbranch(as, PPCI_BC, ismax ? CC_GT : CC_LT, l_end);
+    } else {
+      /* fcmpu; [fmr dest,right]; b<!lt|!gt> l_end; fmr dest,left; l_end: */
+      emit_fb(as, PPCI_FMR, dest, left);
+      emit_condbranch(as, PPCI_BC, ismax ? CC_LE : CC_GE, l_end);
+      if (dest != right) emit_fb(as, PPCI_FMR, dest, right);
+    }
+    emit_fab(as, PPCI_FCMPU, 0, left, right);
+  } else {
+    Reg dest = ra_dest(as, ir, RSET_GPR);
+    Reg right, left = ra_alloc2(as, ir, RSET_GPR);
+    right = (left >> 8); left &= 255;
+    /* cmpw left,right; isel dest, left, right, cr0.LT (min) / cr0.GT (max) */
+    emit_isel(as, dest, left, right, ismax ? 1 : 0);
+    emit_tab(as, PPCI_CMPW, PPC_CRF_CMP, left, right);
+  }
+}
+#else
 static void asm_min_max(ASMState *as, IRIns *ir, int ismax)
 {
   if (!LJ_SOFTFP && irt_isnum(ir->t)) {
@@ -2838,6 +3262,7 @@ static void asm_min_max(ASMState *as, IRIns *ir, int ismax)
     emit_asi(as, PPCI_XORIS, tmp1, left, 0x8000);
   }
 }
+#endif
 
 #define asm_min(as, ir)		asm_min_max(as, ir, 0)
 #define asm_max(as, ir)		asm_min_max(as, ir, 1)
@@ -2893,6 +3318,10 @@ static void asm_intcomp_(ASMState *as, IRRef lref, IRRef rref, Reg cr,
 	emit_tai(as, is64 ? PPCI_CMPLDI : PPCI_CMPLWI, cr, left, (int32_t)k);
 	return;
       }
+    }
+    if (is64 && (cc & 3) == (CC_EQ & 3) && checku16(k)) {  /* 64-bit EQ/NE. */
+      emit_tai(as, PPCI_CMPLDI, cr, left, (int32_t)k);
+      return;
     }
   }
   right = ra_alloc1(as, rref, rset_exclude(RSET_GPR, left));
@@ -3356,11 +3785,38 @@ static void asm_loop_tail_fixup(ASMState *as)
 
 /* -- Head of trace ------------------------------------------------------- */
 
+#if LJ_ARCH_PPC64
+/* POWER8 overflow path (3.7, C9): a trace that guards on the sticky cr0.SO
+** clears XER once, at its head, instead of BC_JLOOP clearing it on every
+** entry. Emitted first here, so it executes last in the head, after the
+** frame push and the register moves and before the first guard; r0 is
+** never live across handlers. mtxer is a serializing SPR write (37.5 ns,
+** C1), which is why only traces that need it emit it. The ISA 3.0 path
+** never tests SO and never gets this. LJ_TEST_BREAK_XERCLR omits it: a
+** stale SO planted before the entry then exits the trace at its first
+** overflow guard, on every entry.
+*/
+static void asm_head_clearxer(ASMState *as)
+{
+#ifndef LJ_TEST_BREAK_XERCLR
+  if (as->xerclr) {
+    emit_tab(as, PPCI_MTXER, RID_TMP, 0, 0);
+    emit_ti(as, PPCI_LI, RID_TMP, 0);
+  }
+#else
+  UNUSED(as);
+#endif
+}
+#else
+#define asm_head_clearxer(as)	UNUSED(as)
+#endif
+
 /* Coalesce BASE register for a root trace. */
 static void asm_head_root_base(ASMState *as)
 {
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
+  asm_head_clearxer(as);
   if (ra_hasreg(r)) {
     ra_free(as, r);
     if (rset_test(as->modset, r) || irt_ismarked(ir->t))
@@ -3375,6 +3831,7 @@ static Reg asm_head_side_base(ASMState *as, IRIns *irp)
 {
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
+  asm_head_clearxer(as);
   if (ra_hasreg(r)) {
     ra_free(as, r);
     if (rset_test(as->modset, r) || irt_ismarked(ir->t))
@@ -3484,11 +3941,68 @@ static Reg asm_setup_call_slots(ASMState *as, IRIns *ir, const CCallInfo *ci)
 
 static void asm_setup_target(ASMState *as)
 {
+#if LJ_ARCH_PPC64
+  as->xerclr = 0;
+#endif
   asm_exitstub_setup(as, as->T->nsnap + (as->parent ? 1 : 0));
 }
 
 /* -- Trace patching ------------------------------------------------------ */
 
+#if LJ_ARCH_PPC64
+/* Patch exit jumps of existing machine code to a new target.
+**
+** PPC64: no `clearso' prepend. ppc32 grew the new side trace by one mcrxr
+** when the patched exit was a bso, because SO is sticky and the side trace
+** starts with it set. Here every trace that tests SO clears XER in its own
+** head (asm_head_clearxer), root or side, so a side trace reached from an
+** SO exit is covered by construction and the ISA 3.0 path (cr7.GT) never
+** tests SO at all. The bc detection is by opcode and displacement, so the
+** cr7 guards are patched like any other.
+*/
+void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
+{
+  MCode *p = T->mcode;
+  MCode *pe = (MCode *)((char *)p + T->szmcode);
+  MCode *px = exitstub_trace_addr(T, exitno);
+  MCode *cstart = NULL;
+  MCode *mcarea = lj_mcode_patch(J, p, 0);
+  int patchlong = 1;
+  for (; p < pe; p++) {
+    /* Look for exitstub branch, try to replace with branch to target. */
+    uint32_t ins = *p;
+    if ((ins & 0xfc000000u) == 0x40000000u &&
+	((ins ^ ((char *)px-(char *)p)) & 0xffffu) == 0) {
+      ptrdiff_t delta = (char *)target - (char *)p;
+      /* Many, but not all short-range branches can be patched directly. */
+      if (p[-1] == PPC_NOPATCH_GC_CHECK) {
+	patchlong = 0;
+      } else if (((delta + 0x8000) >> 16) == 0) {
+	*p = (ins & 0xffdf0000u) | ((uint32_t)delta & 0xffffu) |
+	     ((delta & 0x8000) * (PPCF_Y/0x8000));
+	if (!cstart) cstart = p;
+      }
+    } else if ((ins & 0xfc000000u) == PPCI_B &&
+	       ((ins ^ ((char *)px-(char *)p)) & 0x03ffffffu) == 0) {
+      ptrdiff_t delta = (char *)target - (char *)p;
+      lj_assertJ(((delta + 0x02000000) >> 26) == 0,
+		 "branch target out of range");
+      *p = PPCI_B | ((uint32_t)delta & 0x03ffffffu);
+      if (!cstart) cstart = p;
+    }
+  }
+  /* Always patch long-range branch in exit stub itself. Except, if we can't. */
+  if (patchlong) {
+    ptrdiff_t delta = (char *)target - (char *)px;
+    lj_assertJ(((delta + 0x02000000) >> 26) == 0,
+	       "branch target out of range");
+    *px = PPCI_B | ((uint32_t)delta & 0x03ffffffu);
+  }
+  if (!cstart) cstart = px;
+  lj_mcode_sync(cstart, px+1);
+  lj_mcode_patch(J, mcarea, 1);
+}
+#else
 /* Patch exit jumps of existing machine code to a new target. */
 void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
 {
@@ -3543,6 +4057,7 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
   }
   lj_mcode_patch(J, mcarea, 1);
 }
+#endif
 
 
 /* -- PPC64 per-handler redirection (generated) --------------------------- */
@@ -3554,53 +4069,16 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
 /* PPC64_CONVERTED: asm_callx asm_ahuvload asm_ahustore asm_sload asm_fload
    asm_fstore asm_xload asm_xstore asm_href asm_hrefk asm_uref asm_fref
    asm_strref asm_aref asm_retf asm_cnew asm_tbar asm_obar asm_add asm_sub
-   asm_comp asm_equal asm_conv asm_tobit asm_hiop */
+   asm_comp asm_equal asm_conv asm_tobit asm_hiop
+   asm_mul asm_neg asm_abs asm_fpdiv asm_fpmath asm_addov asm_subov asm_mulov
+   asm_bnot asm_bswap asm_band asm_bor asm_bxor asm_bshl asm_bshr asm_bsar
+   asm_brol asm_min asm_max asm_strto */
 
 #if LJ_ARCH_PPC64
 /* BEGIN GENERATED: lj_ppc64_nyi_gen.py -- do not edit by hand. */
-#undef asm_abs
-#define asm_abs(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fpunary)
-#undef asm_addov
-#define asm_addov(as, ir)	asm_nyi64((as), (ir), (const void *)asm_arithov)
-#undef asm_band
-#define asm_band(as, ir)	asm_nyi64((as), (ir), (const void *)asm_band)
-#undef asm_bnot
-#define asm_bnot(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bnot)
-#undef asm_bor
-#define asm_bor(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitop)
-#undef asm_brol
-#define asm_brol(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
 #undef asm_bror
 #define asm_bror(as, ir)	asm_nyi64((as), (ir), NULL)
-#undef asm_bsar
-#define asm_bsar(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
-#undef asm_bshl
-#define asm_bshl(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
-#undef asm_bshr
-#define asm_bshr(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
-#undef asm_bswap
-#define asm_bswap(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bswap)
-#undef asm_bxor
-#define asm_bxor(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitop)
-#undef asm_fpdiv
-#define asm_fpdiv(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fparith)
-#undef asm_fpmath
-#define asm_fpmath(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fpmath)
-#undef asm_max
-#define asm_max(as, ir)	asm_nyi64((as), (ir), (const void *)asm_min_max)
-#undef asm_min
-#define asm_min(as, ir)	asm_nyi64((as), (ir), (const void *)asm_min_max)
-#undef asm_mul
-#define asm_mul(as, ir)	asm_nyi64((as), (ir), (const void *)asm_mul)
-#undef asm_mulov
-#define asm_mulov(as, ir)	asm_nyi64((as), (ir), (const void *)asm_arithov)
-#undef asm_neg
-#define asm_neg(as, ir)	asm_nyi64((as), (ir), (const void *)asm_neg)
 #undef asm_prof
 #define asm_prof(as, ir)	asm_nyi64((as), (ir), (const void *)asm_prof)
-#undef asm_strto
-#define asm_strto(as, ir)	asm_nyi64((as), (ir), (const void *)asm_strto)
-#undef asm_subov
-#define asm_subov(as, ir)	asm_nyi64((as), (ir), (const void *)asm_arithov)
 /* END GENERATED */
 #endif

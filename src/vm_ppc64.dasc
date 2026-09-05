@@ -1864,13 +1864,21 @@ static void build_subroutines(BuildCtx *ctx)
   |   bge cr1, ->fff_resn
   |  checknum_noclear CARG2; bge >7
   |6:
-  |  fsub f0, FARG1, FARG2
+  |  // x < y ? x : y (min) / x > y ? x : y (max), as lj_vm_foldarith and
+  |  // the other 64-bit ports (arm64 fcsel, x64 minsd): a NaN in either
+  |  // operand and an equal pair (+0/-0) yield the *right* operand. The
+  |  // ppc32 fsub+fsel form returned the left one on NaN and the wrong
+  |  // zero for max; -joff and the JIT must agree on this, and upstream
+  |  // aarch64 is the reference.
+  |  fcmpu cr0, FARG1, FARG2
   |   addi TMP1, TMP1, 8
   |.if ismax
-  |  fsel FARG1, f0, FARG1, FARG2
+  |  bgt >8
   |.else
-  |  fsel FARG1, f0, FARG2, FARG1
+  |  blt >8
   |.endif
+  |  fmr FARG1, FARG2
+  |8:
   |  b <5
   |7:  // Convert integer to number and continue above.
   |   ld CARG2, 0(TMP1)
@@ -2517,8 +2525,15 @@ static void build_subroutines(BuildCtx *ctx)
   |// NYI: Use internal implementations of floor, ceil, trunc.
   |
   |->vm_modi:
-  |  divdo. TMP0, CARG1, CARG2
-  |  bso >1
+  |  // int32 inputs are sign-extended (ELFv2, D3), so the 64-bit divide
+  |  // cannot overflow: INT_MIN / -1 = 2^31 fits, and a - (2^31 * -1) = 0
+  |  // is the right answer. No OE form, no XER, no clearxer: the old
+  |  // divdo./bso form took its overflow arm on a *stale* sticky SO too and
+  |  // then returned 0 for a nonzero divisor. Divisor 0 is guarded by every
+  |  // caller (lj_opt_narrow_mod, BC_MOD) and yields 0 here as before.
+  |  cmpdi CARG2, 0
+  |  beq >1
+  |  divd TMP0, CARG1, CARG2
   |   xor CARG3, CARG1, CARG2
   |   cmpdi CARG3, 0
   |  mulld TMP0, TMP0, CARG2
@@ -2527,11 +2542,15 @@ static void build_subroutines(BuildCtx *ctx)
   |  cmpdi CARG1, 0; beqlr
   |  add CARG1, CARG1, CARG2
   |  blr
-  |1:
+  |1:  // Zero divisor: the interpreter's BC_MOD expects XER.OV set (its
+  |  // `bso' + checkov then take the FP path, which yields NaN); divdo.
+  |  // used to leave that behind implicitly. Set OV|SO and let the cmpdi
+  |  // copy XER.SO into cr0.SO. The JIT never calls with a zero divisor
+  |  // (lj_opt_narrow_mod guards it) and reads CARG1 only.
+  |  lus TMP0, 0xc000
+  |  mtxer TMP0
   |  cmpdi CARG2, 0
-  |   li CARG1, 0
-  |  beqlr
-  |  clearxer			// Clear SO for -2147483648 % -1 and return 0.
+  |  li CARG1, 0
   |  blr
   |
   |//-----------------------------------------------------------------------
@@ -4310,8 +4329,30 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   li TMP1, BC_ITERC
     |  stb TMP0, -4(PC)
     |    addis PC, TMP3, -(BCBIAS_J*4 >> 16)
+    |.if JIT
+    |  // The ITERN may already have been replaced by a JLOOP (the loop got
+    |  // compiled through a `next' iterator): then the op byte belongs to
+    |  // the JLOOP and the trace's saved startins must be despecialized
+    |  // instead, as on arm64/mips64. ppc32 never did this ("NYI on
+    |  // big-endian"), which overwrote the JLOOP with an ITERC carrying the
+    |  // trace number as RD.
+    |  lbz TMP2, 0(PC)
+    |  cmpwi TMP2, BC_ITERN
+    |  bne >6
+    |.endif
     |   stb TMP1, 0(PC)
     |  b <1
+    |.if JIT
+    |6:  // Unpatch JLOOP.
+    |  ld TMP3, DISPATCH_J(trace)(DISPATCH)
+    |  lhz TMP2, 2(PC)			// RD of the JLOOP = trace number (LE).
+    |  sldi TMP2, TMP2, 3
+    |  ldx TRACE:TMP3, TMP3, TMP2
+    |  lwz TMP2, TRACE:TMP3->startins
+    |  rlwimi TMP2, TMP1, 0, 24, 31	// Op byte (LE: low byte) <- BC_ITERC.
+    |  stw TMP2, 0(PC)
+    |  b <1
+    |.endif
     break;
 
   case BC_VARG:

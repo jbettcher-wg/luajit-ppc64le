@@ -138,7 +138,7 @@ local map_ext = setmetatable({
   [412] = "orcRR~R.", [444] = "or|mrRR~R=.", [476] = "nandRR~R.",
   [508] = "cmpbRR~R",
 
-  [512] = "mcrxrX",
+  [512] = "mcrxrX", [576] = "mcrxrxX",
 
   [532] = "ldbrxRR0R", [660] = "stdbrxRR0R",
 

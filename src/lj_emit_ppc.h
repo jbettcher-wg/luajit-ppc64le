@@ -409,15 +409,19 @@ typedef MCode *MCLabel;
 ** that from its exit stubs cannot be encoded; abort it (R9), a release
 ** build must not truncate the field.
 */
-static void emit_condbranch(ASMState *as, PPCIns pi, PPCCC cc, MCode *target)
+static void emit_condbranch_crf(ASMState *as, PPCIns pi, int crf, PPCCC cc,
+				MCode *target)
 {
   MCode *p = --as->mcp;
   ptrdiff_t delta = (char *)target - (char *)p;
   if (LJ_UNLIKELY(((delta + 0x8000) >> 16) != 0))
     lj_trace_err(as->J, LJ_TRERR_MCODEOV);
   pi ^= (delta & 0x8000) * (PPCF_Y/0x8000);
-  *p = pi | PPCF_CC(cc) | ((uint32_t)delta & 0xffffu);
+  *p = pi | PPCF_CC(cc) | PPCF_CRBI(crf) | ((uint32_t)delta & 0xffffu);
 }
+
+#define emit_condbranch(as, pi, cc, target) \
+  emit_condbranch_crf(as, (pi), 0, (cc), (target))
 
 static void emit_jmp(ASMState *as, MCode *target)
 {
