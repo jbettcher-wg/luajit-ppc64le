@@ -345,6 +345,17 @@ static void emit_lsptr(ASMState *as, PPCIns pi, Reg r, void *p, RegSet allow)
     i = i-jgl-32768;
     base = RID_JGL;
   } else {
+#if LJ_ARCH_PPC64
+    /* C50: never take a register the current handler still has to write.
+    ** ra_rematk() reaches here from inside ra_scratch()/ra_evict(), so the
+    ** load being emitted runs *after* the handler's own instructions, and
+    ** its base must survive them. Without this, a TOBIT whose GPR dest was
+    ** just freed by ra_dest() gets that register as the shared 64 KB KNUM
+    ** base and clobbers it one instruction before the lfd reads it.
+    */
+    RegSet a = allow & ~as->kbexcl;
+    if (a) allow = a;
+#endif
     base = ra_allock(as, i-(int16_t)i, allow);
     i = (int16_t)i;
   }

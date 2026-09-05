@@ -99,6 +99,7 @@ typedef struct ASMState {
 #endif
 #if LJ_ARCH_PPC64
   int xerclr;		/* Trace has a sticky-SO guard: head clears XER. */
+  RegSet kbexcl;	/* GPRs the current handler has yet to write. */
 #endif
 
 #ifdef LUAJIT_RANDOM_RA
@@ -365,6 +366,9 @@ static void ra_setup(ASMState *as)
   as->freeset = RSET_INIT;
   as->modset = RSET_EMPTY;
   as->weakset = RSET_EMPTY;
+#if LJ_ARCH_PPC64
+  as->kbexcl = RSET_EMPTY;
+#endif
   as->phiset = RSET_EMPTY;
   memset(as->phireg, 0, sizeof(as->phireg));
   for (r = RID_MIN_GPR; r < RID_MAX; r++)
@@ -782,6 +786,16 @@ static Reg ra_dest(ASMState *as, IRIns *ir, RegSet allow)
     }
     ir->r = dest;
   }
+#if LJ_ARCH_PPC64
+  /* C50: ra_dest has just put dest back in the free set, but the handler
+  ** has not emitted the instruction that writes it yet. Anything allocated
+  ** from here on for code the assembler has ALREADY emitted -- i.e. code
+  ** that runs AFTER this instruction -- must not use dest. The one such
+  ** allocator on PPC64 is emit_lsptr's GPR base for a KNUM load, which
+  ** ra_rematk emits from inside ra_scratch/ra_evict.
+  */
+  as->kbexcl = RID2RSET(dest);
+#endif
   if (LJ_UNLIKELY(ra_hasspill(ir->s))) ra_save(as, ir, dest);
   return dest;
 }
