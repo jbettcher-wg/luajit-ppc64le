@@ -3,6 +3,30 @@
 ** Copyright (C) 2005-2026 Mike Pall. See Copyright Notice in luajit.h
 */
 
+/* -- PPC64 phase-1 gate --------------------------------------------------- */
+
+#if LJ_ARCH_PPC64
+/* The handlers below are still the ppc32 backend: 32-bit loads, 32-bit
+** tags, ppc32 frame. Until each one is converted (Phases 2-4 of the
+** ppc64le backend plan) every path that could emit code is redirected here,
+** so a JIT-enabled build degrades to the interpreter instead of running
+** ppc32 code on a 64-bit machine. The per-handler redirection block at the
+** end of this file is generated from lj_asm.c/lj_asm_ppc.h; remove a
+** handler's line there when its 64-bit version lands.
+*/
+static void asm_nyi64_gate(ASMState *as)
+{
+  lj_trace_err(as->J, LJ_TRERR_NYIPPC64);
+}
+
+static void asm_nyi64(ASMState *as, IRIns *ir, const void *handler)
+{
+  UNUSED(handler);  /* Keeps the still-unconverted ppc32 handler referenced. */
+  setintV(&as->J->errinfo, ir->o);
+  lj_trace_err_info(as->J, LJ_TRERR_NYIIR);
+}
+#endif
+
 /* -- Register allocator extensions --------------------------------------- */
 
 /* Allocate a register with a hint. */
@@ -57,6 +81,11 @@ static void asm_exitstub_setup(ASMState *as, ExitNo nexits)
   /* !ind: 1: mflr r0; bl ->vm_exit_handler; li r0, traceno;
   **  ind: 1: lwz r0, K32_VXH(jgl); mtctr r0; mflr r0; bctrl; li r0, traceno;
   **          bl <1; bl <1; ...
+  ** PPC64 ind: ld r0, K64_VXH(jgl) instead of lwz. r0 (RID_TMP) is the only
+  ** register that may be clobbered here: every allocatable register is live
+  ** at an exit and lands in the ExitState, so r12 is *not* an option even
+  ** though ELFv2 would like it (->vm_exit_handler has no TOC prologue and
+  ** does not need it, see D2/Model A).
   */
   for (i = nexits-1; (int32_t)i >= 0; i--)
     *--mxp = PPCI_BL | (((-3-ind-i) & 0x00ffffffu) << 2);
@@ -66,8 +95,15 @@ static void asm_exitstub_setup(ASMState *as, ExitNo nexits)
     *--mxp = PPCI_BCTRL;
     *--mxp = PPCI_MFLR | PPCF_T(RID_TMP);
     *--mxp = PPCI_MTCTR | PPCF_T(RID_TMP);
+#if LJ_ARCH_PPC64
+    lj_assertA((jglofs(as, &as->J->k64[LJ_K64_VM_EXIT_HANDLER]) & 3) == 0,
+	       "unaligned DS-form displacement");
+    *--mxp = PPCI_LD | PPCF_T(RID_TMP) | PPCF_A(RID_JGL) |
+	     jglofs(as, &as->J->k64[LJ_K64_VM_EXIT_HANDLER]);
+#else
     *--mxp = PPCI_LWZ | PPCF_T(RID_TMP) | PPCF_A(RID_JGL) |
 	     jglofs(as, &as->J->k32[LJ_K32_VM_EXIT_HANDLER]);
+#endif
   } else {
     mxp--;
     *mxp = PPCI_BL | ((target - (uintptr_t)mxp) & 0x03fffffcu);
@@ -272,6 +308,9 @@ static int asm_fusemadd(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pir)
 /* Generate a call to a C function. */
 static void asm_gencall(ASMState *as, const CCallInfo *ci, IRRef *args)
 {
+#if LJ_ARCH_PPC64
+  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
+#endif
   uint32_t n, nargs = CCI_XNARGS(ci);
   int32_t ofs = 8;
   Reg gpr = REGARG_FIRSTGPR;
@@ -1473,7 +1512,7 @@ static void asm_arithov(ASMState *as, IRIns *ir, PPCIns pi)
 #define asm_subov(as, ir)	asm_arithov(as, ir, PPCI_SUBFO)
 #define asm_mulov(as, ir)	asm_arithov(as, ir, PPCI_MULLWO)
 
-#if LJ_HASFFI
+#if LJ_HASFFI && LJ_32
 static void asm_add64(ASMState *as, IRIns *ir)
 {
   Reg dest = ra_dest(as, ir, RSET_GPR);
@@ -1926,7 +1965,7 @@ static void asm_sfpcomp(ASMState *as, IRIns *ir)
 }
 #endif
 
-#if LJ_HASFFI
+#if LJ_HASFFI && LJ_32
 /* 64 bit integer comparisons. */
 static void asm_comp64(ASMState *as, IRIns *ir)
 {
@@ -1955,6 +1994,7 @@ static void asm_comp64(ASMState *as, IRIns *ir)
 /* Hiword op of a split 32/32 bit op. Previous op is be the loword op. */
 static void asm_hiop(ASMState *as, IRIns *ir)
 {
+#if LJ_32
   /* HIOP is marked as a store because it needs its own DCE logic. */
   int uselo = ra_used(ir-1), usehi = ra_used(ir);  /* Loword/hiword used? */
   if (LJ_UNLIKELY(!(as->flags & JIT_F_OPT_DCE))) uselo = usehi = 1;
@@ -2020,6 +2060,10 @@ static void asm_hiop(ASMState *as, IRIns *ir)
     break;
   default: lj_assertA(0, "bad HIOP for op %d", (ir-1)->o); break;
   }
+#else
+  /* HIOP only exists for split 32/32 bit ops; 64 bit PPC never emits it. */
+  UNUSED(as); UNUSED(ir); lj_assertA(0, "unexpected HIOP");
+#endif
 }
 
 /* -- Profiling ----------------------------------------------------------- */
@@ -2126,6 +2170,9 @@ static void asm_stack_restore(ASMState *as, SnapShot *snap)
 /* Check GC threshold and do one or more GC steps. */
 static void asm_gc_check(ASMState *as)
 {
+#if LJ_ARCH_PPC64
+  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
+#endif
   const CCallInfo *ci = &lj_ir_callinfo[IRCALL_lj_gc_step_jit];
   IRRef args[2];
   MCLabel l_end;
@@ -2177,6 +2224,9 @@ static void asm_loop_tail_fixup(ASMState *as)
 /* Coalesce BASE register for a root trace. */
 static void asm_head_root_base(ASMState *as)
 {
+#if LJ_ARCH_PPC64
+  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
+#endif
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
   if (ra_hasreg(r)) {
@@ -2191,6 +2241,9 @@ static void asm_head_root_base(ASMState *as)
 /* Coalesce BASE register for a side trace. */
 static Reg asm_head_side_base(ASMState *as, IRIns *irp)
 {
+#if LJ_ARCH_PPC64
+  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
+#endif
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
   if (ra_hasreg(r)) {
@@ -2226,8 +2279,13 @@ static void asm_tail_fixup(ASMState *as, TraceNo lnk)
   if ((((target - (uintptr_t)mcp) + 0x02000000u) >> 26) == 0) {
     *mcp = PPCI_B | ((target - (uintptr_t)mcp) & 0x03fffffcu); mcp++;
   } else {
+#if LJ_ARCH_PPC64
+    *mcp++ = PPCI_LD | PPCF_T(RID_TMP) | PPCF_A(RID_JGL) |
+	     jglofs(as, &as->J->k64[LJ_K64_VM_EXIT_INTERP]);
+#else
     *mcp++ = PPCI_LWZ | PPCF_T(RID_TMP) | PPCF_A(RID_JGL) |
 	     jglofs(as, &as->J->k32[LJ_K32_VM_EXIT_INTERP]);
+#endif
     *mcp++ = PPCI_MTCTR | PPCF_T(RID_TMP);
     *mcp++ = PPCI_BCTR;
   }
@@ -2336,3 +2394,102 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
   lj_mcode_patch(J, mcarea, 1);
 }
 
+
+/* -- PPC64 phase-1 per-handler redirection (generated) ------------------- */
+
+#if LJ_ARCH_PPC64
+/* BEGIN GENERATED: lj_ppc64_nyi_gen.py -- do not edit by hand. */
+#undef asm_abs
+#define asm_abs(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fpunary)
+#undef asm_add
+#define asm_add(as, ir)	asm_nyi64((as), (ir), (const void *)asm_add)
+#undef asm_addov
+#define asm_addov(as, ir)	asm_nyi64((as), (ir), (const void *)asm_arithov)
+#undef asm_ahustore
+#define asm_ahustore(as, ir)	asm_nyi64((as), (ir), (const void *)asm_ahustore)
+#undef asm_ahuvload
+#define asm_ahuvload(as, ir)	asm_nyi64((as), (ir), (const void *)asm_ahuvload)
+#undef asm_aref
+#define asm_aref(as, ir)	asm_nyi64((as), (ir), (const void *)asm_aref)
+#undef asm_band
+#define asm_band(as, ir)	asm_nyi64((as), (ir), (const void *)asm_band)
+#undef asm_bnot
+#define asm_bnot(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bnot)
+#undef asm_bor
+#define asm_bor(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitop)
+#undef asm_brol
+#define asm_brol(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
+#undef asm_bror
+#define asm_bror(as, ir)	asm_nyi64((as), (ir), NULL)
+#undef asm_bsar
+#define asm_bsar(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
+#undef asm_bshl
+#define asm_bshl(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
+#undef asm_bshr
+#define asm_bshr(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitshift)
+#undef asm_bswap
+#define asm_bswap(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bswap)
+#undef asm_bxor
+#define asm_bxor(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitop)
+#undef asm_callx
+#define asm_callx(as, ir)	asm_nyi64((as), (ir), (const void *)asm_callx)
+#undef asm_cnew
+#define asm_cnew(as, ir)	asm_nyi64((as), (ir), (const void *)asm_cnew)
+#undef asm_comp
+#define asm_comp(as, ir)	asm_nyi64((as), (ir), (const void *)asm_comp)
+#undef asm_conv
+#define asm_conv(as, ir)	asm_nyi64((as), (ir), (const void *)asm_conv)
+#undef asm_equal
+#define asm_equal(as, ir)	asm_nyi64((as), (ir), (const void *)asm_comp)
+#undef asm_fload
+#define asm_fload(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fload)
+#undef asm_fpdiv
+#define asm_fpdiv(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fparith)
+#undef asm_fpmath
+#define asm_fpmath(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fpmath)
+#undef asm_fref
+#define asm_fref(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fref)
+#undef asm_fstore
+#define asm_fstore(as, ir)	asm_nyi64((as), (ir), (const void *)asm_fstore)
+#undef asm_hiop
+#define asm_hiop(as, ir)	asm_nyi64((as), (ir), (const void *)asm_hiop)
+#undef asm_hrefk
+#define asm_hrefk(as, ir)	asm_nyi64((as), (ir), (const void *)asm_hrefk)
+#undef asm_max
+#define asm_max(as, ir)	asm_nyi64((as), (ir), (const void *)asm_min_max)
+#undef asm_min
+#define asm_min(as, ir)	asm_nyi64((as), (ir), (const void *)asm_min_max)
+#undef asm_mul
+#define asm_mul(as, ir)	asm_nyi64((as), (ir), (const void *)asm_mul)
+#undef asm_mulov
+#define asm_mulov(as, ir)	asm_nyi64((as), (ir), (const void *)asm_arithov)
+#undef asm_neg
+#define asm_neg(as, ir)	asm_nyi64((as), (ir), (const void *)asm_neg)
+#undef asm_obar
+#define asm_obar(as, ir)	asm_nyi64((as), (ir), (const void *)asm_obar)
+#undef asm_prof
+#define asm_prof(as, ir)	asm_nyi64((as), (ir), (const void *)asm_prof)
+#undef asm_retf
+#define asm_retf(as, ir)	asm_nyi64((as), (ir), (const void *)asm_retf)
+#undef asm_sload
+#define asm_sload(as, ir)	asm_nyi64((as), (ir), (const void *)asm_sload)
+#undef asm_strref
+#define asm_strref(as, ir)	asm_nyi64((as), (ir), (const void *)asm_strref)
+#undef asm_strto
+#define asm_strto(as, ir)	asm_nyi64((as), (ir), (const void *)asm_strto)
+#undef asm_sub
+#define asm_sub(as, ir)	asm_nyi64((as), (ir), (const void *)asm_sub)
+#undef asm_subov
+#define asm_subov(as, ir)	asm_nyi64((as), (ir), (const void *)asm_arithov)
+#undef asm_tbar
+#define asm_tbar(as, ir)	asm_nyi64((as), (ir), (const void *)asm_tbar)
+#undef asm_tobit
+#define asm_tobit(as, ir)	asm_nyi64((as), (ir), (const void *)asm_tobit)
+#undef asm_uref
+#define asm_uref(as, ir)	asm_nyi64((as), (ir), (const void *)asm_uref)
+#undef asm_xload
+#define asm_xload(as, ir)	asm_nyi64((as), (ir), (const void *)asm_xload)
+#undef asm_xstore
+#define asm_xstore(as, ir)	asm_nyi64((as), (ir), (const void *)asm_xstore_)
+/* END GENERATED */
+#endif

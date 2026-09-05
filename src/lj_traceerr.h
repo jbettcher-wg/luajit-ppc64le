@@ -51,6 +51,7 @@ TREDEF(MCODELM,	"hit mcode limit (retrying)")
 TREDEF(SPILLOV,	"too many spill slots")
 TREDEF(BADRA,	"inconsistent register allocation")
 TREDEF(NYIIR,	"NYI: cannot assemble IR instruction %d")
+TREDEF(NYIPPC64,	"NYI: ppc64le backend has no code emitter yet")
 TREDEF(NYIPHI,	"NYI: PHI shuffling too complex")
 TREDEF(NYICOAL,	"NYI: register coalescing too complex")
 

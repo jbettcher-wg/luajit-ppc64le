@@ -71,8 +71,14 @@ enum {
 #define REGARG_LASTGPR		RID_R10
 #define REGARG_NUMGPR		8
 #define REGARG_FIRSTFPR		RID_F1
+#if LJ_ARCH_PPC64
+/* ELFv2 passes FP arguments in f1-f13. */
+#define REGARG_LASTFPR		RID_F13
+#define REGARG_NUMFPR		13
+#else
 #define REGARG_LASTFPR		RID_F8
 #define REGARG_NUMFPR		8
+#endif
 
 /* -- Spill slots --------------------------------------------------------- */
 
@@ -87,6 +93,42 @@ enum {
 ** [sp+ 4] tmpw, LR of callee
 ** [sp+ 0] stack chain
 */
+#if LJ_ARCH_PPC64
+/* PPC64 ELFv2 (see vm_ppc64.dasc for the interpreter frame):
+**
+** [sp+96..] spill slots 24.. / stack-passed C arguments 9+
+** [sp+32..95] parameter save area: callee-scratch (a variadic callee
+**             stores its incoming GPR args here), never keep data in it
+** [sp+24] TOC save doubleword (r2 lives here for the frame's lifetime)
+** [sp+16] LR save doubleword: written by every callee's prologue, dead
+**         between calls -- the only header slot usable as a scratch temp
+** [sp+ 8] CR save word
+** [sp+ 0] back chain
+**
+** Slots are still 4 bytes wide, so the 96-byte header is 24 slots.
+** In the interpreter frame (spadjust == 0) bytes 96..111 are unused
+** (SAVE_ERRF ends at 92, SAVE_GPR_ starts at 112), which gives four
+** fixed slots 24..27; that region is also where lj_vm_next's result
+** TValue pair lands (lj_asm.c requires SPS_FIRST+4 slots).
+**
+** A trace that needs more slots gets a whole fresh frame: the ppc32 trick
+** of letting the new frame's upper slots overlap the caller's free area
+** cannot work here, because anything above the new header would land in
+** the caller's 0..95 ABI header. Hence sps_align rounds the *entire*
+** slot count, not the excess over SPS_FIXED.
+*/
+#define SPS_FIXED	28
+#define SPS_FIRST	24
+
+/* Only the LR save slot is scratch. LE: the low word is at the lower address. */
+#define SPOFS_TMPW	16
+#define SPOFS_TMP	16
+#define SPOFS_TMPHI	20
+#define SPOFS_TMPLO	16
+
+#define sps_scale(slot)		(4 * (int32_t)(slot))
+#define sps_align(slot)		(((slot) + 3) & ~3)
+#else
 #define SPS_FIXED	7
 #define SPS_FIRST	4
 
@@ -98,15 +140,29 @@ enum {
 
 #define sps_scale(slot)		(4 * (int32_t)(slot))
 #define sps_align(slot)		(((slot) - SPS_FIXED + 3) & ~3)
+#endif
 
 /* -- Exit state ---------------------------------------------------------- */
 
-/* This definition must match with the *.dasc file(s). */
+/* This definition must match with the *.dasc file(s).
+**
+** PPC64 (->vm_exit_handler in vm_ppc64.dasc): fpr[] at ex+0, gpr[] at
+** ex+256, spill[] at ex+512 == the trace's own sp, so spill[slot] is the
+** trace's slot at 4*slot(sp). The handler's frame is 96 (ELFv2 header)
+** + 256 + 256 = 608 bytes and ex = handler sp + 96. gpr[RID_TMP] is
+** stored as 0 and gpr[RID_SP] as the trace's sp, as on ppc32.
+*/
 typedef struct {
   lua_Number fpr[RID_NUM_FPR];	/* Floating-point registers. */
   intptr_t gpr[RID_NUM_GPR];	/* General-purpose registers. */
   int32_t spill[256];		/* Spill slots. */
 } ExitState;
+
+#if LJ_ARCH_PPC64
+LJ_STATIC_ASSERT(offsetof(ExitState, gpr) == 256);
+LJ_STATIC_ASSERT(offsetof(ExitState, spill) == 512);
+LJ_STATIC_ASSERT(sizeof(intptr_t) == 8);
+#endif
 
 /* Highest exit + 1 indicates stack check. */
 #define EXITSTATE_CHECKEXIT	1
@@ -132,8 +188,12 @@ static LJ_AINLINE uint32_t *exitstub_trace_addr_(uint32_t *p, uint32_t exitno)
 #define PPCF_C(r)	((r) << 6)
 #define PPCF_MB(n)	((n) << 6)
 #define PPCF_ME(n)	((n) << 1)
-#define PPCF_SH(n)	((((n) & 31) << (11+1)) | (((n) & 32) >> (5-1)))
-#define PPCF_M6(n)	((((n) & 31) << (5+1)) | (((n) & 32) << (11-5)))
+/* MD/XS-form split fields: sh[0:4] at bits 11..15, sh[5] at bit 1;
+** mb/me[0:4] at bits 6..10, mb/me[5] at bit 5. The 2016 port had both
+** high halves misplaced; the luajit/ppc_encoding_oracle case guards them.
+*/
+#define PPCF_SH(n)	((((n) & 31) << 11) | (((n) & 32) >> 4))
+#define PPCF_M6(n)	((((n) & 31) << 6) | ((n) & 32))
 #define PPCF_Y		0x00200000
 #define PPCF_DOT	0x00000001
 
@@ -227,7 +287,51 @@ typedef enum PPCIns {
   PPCI_MFLR = 0x7c0802a6,
   PPCI_MTCTR = 0x7c0903a6,
 
-  PPCI_MCRXR = 0x7c000400,
+  PPCI_MCRXR = 0x7c000400,	/* ppc32 only: trapped+emulated on POWER8/9. */
+
+  /* 64 bit instructions (PPC64 only). Each constant below is checked
+  ** against gas by the handbook's luajit/ppc_encoding_oracle case.
+  */
+  PPCI_LD = 0xe8000000,
+  PPCI_LDU = 0xe8000001,
+  PPCI_LWA = 0xe8000002,
+  PPCI_STD = 0xf8000000,
+  PPCI_STDU = 0xf8000001,
+  PPCI_LDX = 0x7c00002a,
+  PPCI_LWAX = 0x7c0002aa,
+  PPCI_STDX = 0x7c00012a,
+  PPCI_LDBRX = 0x7c000428,
+  PPCI_STDBRX = 0x7c000528,
+
+  PPCI_CMPD = 0x7c200000,
+  PPCI_CMPLD = 0x7c200040,
+  PPCI_CMPDI = 0x2c200000,
+  PPCI_CMPLDI = 0x28200000,
+
+  PPCI_EXTSW = 0x7c0007b4,
+  PPCI_SLD = 0x7c000036,
+  PPCI_SRD = 0x7c000436,
+  PPCI_SRAD = 0x7c000634,
+  PPCI_SRADI = 0x7c000674,
+  PPCI_MULLD = 0x7c0001d2,
+  PPCI_MULLDO = 0x7c0005d2,
+  PPCI_MULHD = 0x7c000092,
+  PPCI_DIVD = 0x7c0003d2,
+  PPCI_DIVW = 0x7c0003d6,
+  PPCI_CNTLZD = 0x7c000074,
+  PPCI_POPCNTD = 0x7c0003f4,
+
+  PPCI_MTVSRD = 0x7c000166,
+  PPCI_MFVSRD = 0x7c000066,
+  PPCI_MTVSRWA = 0x7c0001a6,
+  PPCI_MTVSRWZ = 0x7c0001e6,
+  PPCI_MFVSRWZ = 0x7c0000e6,
+
+  PPCI_MFXER = 0x7c0102a6,
+  PPCI_MTXER = 0x7c0103a6,
+  PPCI_MTLR = 0x7c0803a6,
+  PPCI_BLR = 0x4e800020,
+  PPCI_MCRXRX = 0x7c000480,	/* ISA 3.0. */
 
   /* Load/store instructions. */
   PPCI_LWZ = 0x80000000,
@@ -268,6 +372,15 @@ typedef enum PPCIns {
 
   PPCI_FRSP = 0xfc000018,
   PPCI_FCTIWZ = 0xfc00001e,
+  PPCI_FCTIWUZ = 0xfc00011e,	/* ISA 2.06+ (PPC64 only). */
+  PPCI_FCTIDZ = 0xfc00065e,
+  PPCI_FCTIDUZ = 0xfc00075e,
+  PPCI_FCFID = 0xfc00069c,
+  PPCI_FCFIDU = 0xfc00079c,
+  PPCI_FRIN = 0xfc000310,
+  PPCI_FRIZ = 0xfc000350,
+  PPCI_FRIP = 0xfc000390,
+  PPCI_FRIM = 0xfc0003d0,
 
   PPCI_FADD = 0xfc00002a,
   PPCI_FSUB = 0xfc000028,

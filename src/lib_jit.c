@@ -646,6 +646,10 @@ JIT_PARAMDEF(JIT_PARAMINIT)
 #if LJ_TARGET_ARM && LJ_TARGET_LINUX
 #include <sys/utsname.h>
 #endif
+#if LJ_ARCH_PPC64 && LJ_TARGET_LINUX
+#include <stdlib.h>
+#include <sys/auxv.h>
+#endif
 
 /* Arch-dependent CPU feature detection. */
 static uint32_t jit_cpudetect(void)
@@ -697,11 +701,32 @@ static uint32_t jit_cpudetect(void)
 
 #elif LJ_TARGET_PPC
 
+#if LJ_ARCH_PPC64
+  /* POWER8 (ISA 2.07) is the compile-time floor (lj_arch.h), so fsqrt and
+  ** frin/friz/frip/frim are unconditional. ISA 3.0 (POWER9: mcrxrx, modsw,
+  ** cnttzd, addpcis, ...) is detected at run time from the auxiliary vector
+  ** and can be forced off for A/B testing of the two paths on one machine:
+  ** LUAJIT_PPC_ISA30=0 in the environment, or -DLUAJIT_DISABLE_ISA30.
+  */
+  flags |= JIT_F_SQRT|JIT_F_ROUND;
+#if LJ_TARGET_LINUX && !defined(LUAJIT_DISABLE_ISA30)
+  {
+    /* PPC_FEATURE2_ARCH_3_00 from <asm/cputable.h>; spelled out to avoid the
+    ** kernel header dependency.
+    */
+    unsigned long hwcap2 = getauxval(AT_HWCAP2);
+    const char *isa30 = getenv("LUAJIT_PPC_ISA30");
+    if ((hwcap2 & 0x00800000UL) && !(isa30 && isa30[0] == '0'))
+      flags |= JIT_F_ISA30;
+  }
+#endif
+#else
 #if LJ_ARCH_SQRT
   flags |= JIT_F_SQRT;
 #endif
 #if LJ_ARCH_ROUND
   flags |= JIT_F_ROUND;
+#endif
 #endif
 
 #elif LJ_TARGET_MIPS

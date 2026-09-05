@@ -368,7 +368,13 @@
 #elif LJ_ARCH_BITS == 64
 #define LJ_ARCH_PPC64		1
 #define LJ_TARGET_GC64		1
-#define LJ_ARCH_NOJIT		1	/* NYI */
+#ifndef _ARCH_PWR8
+/* POWER8 (ISA 2.07) is the floor for the ppc64le JIT backend: it relies on
+** mfvsrd/mtvsrd, fcfidu/fctiduz and friends unconditionally. Older -mcpu
+** builds get the interpreter only.
+*/
+#define LJ_ARCH_NOJIT		1
+#endif
 #endif
 
 #if _ARCH_PWR9

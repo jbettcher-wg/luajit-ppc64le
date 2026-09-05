@@ -101,6 +101,22 @@ static void emit_loadi(ASMState *as, Reg r, int32_t i)
 
 #define emit_loada(as, r, addr)		emit_loadi(as, (r), i32ptr((addr)))
 
+#if LJ_64
+/* Load a 64 bit constant into a GPR.
+** Phase 1: the plain 5-instruction form. The tiered loader (JGL-relative,
+** kdelta, 32-bit shortcuts) is Phase 2 work.
+*/
+static void emit_loadu64(ASMState *as, Reg r, uint64_t u64)
+{
+  /* Emitted backwards: lis; ori; sldi 32; oris; ori. */
+  emit_asi(as, PPCI_ORI, r, r, (int32_t)(u64 & 0xffff));
+  emit_asi(as, PPCI_ORIS, r, r, (int32_t)((u64 >> 16) & 0xffff));
+  *--as->mcp = PPCI_RLDICR | PPCF_T(r) | PPCF_A(r) | PPCF_SH(32) | PPCF_M6(31);
+  emit_asi(as, PPCI_ORI, r, r, (int32_t)((u64 >> 32) & 0xffff));
+  emit_ti(as, PPCI_LIS, r, (int32_t)((u64 >> 48) & 0xffff));
+}
+#endif
+
 static Reg ra_allock(ASMState *as, intptr_t k, RegSet allow);
 
 /* Get/set from constant pointer. */
