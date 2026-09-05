@@ -91,8 +91,8 @@ typedef union FPRArg {
 #if LJ_ARCH_PPC64
 #define CCALL_NARG_GPR		8
 #define CCALL_NARG_FPR		13
-#define CCALL_NRET_GPR		4	/* For complex double. */
-#define CCALL_NRET_FPR		1
+#define CCALL_NRET_GPR		2	/* ELFv2: aggregates <= 16 bytes in r3,r4. */
+#define CCALL_NRET_FPR		8	/* ELFv2: HFA (and complex) in f1..f8. */
 #define CCALL_SPS_EXTRA		14
 #define CCALL_SPS_FREE		0
 #else

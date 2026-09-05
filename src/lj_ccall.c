@@ -373,6 +373,139 @@
 #elif LJ_TARGET_PPC
 /* -- PPC calling conventions --------------------------------------------- */
 
+#if LJ_ARCH_PPC64
+/* -- PPC64 ELFv2 (little-endian) --
+**
+** Every argument owns a contiguous run of doublewords in the parameter save
+** area: doublewords 0..7 are r3..r10, doubleword 8 onwards is the stack at
+** 96(sp). gpr[] and stack[] of CCallState are contiguous (asserted below), so
+** an aggregate's memory image is written in one piece and splits across
+** r10/stack naturally. No aggregate is ever passed by reference.
+**
+** A homogeneous float/double aggregate (HFA, <= 8 elements, no padding)
+** additionally has its leading elements copied into f1..f13 as far as they
+** last; the callee reads the remaining elements from the doublewords. Any
+** other aggregate travels in its doublewords only. Aggregates with 16-byte
+** alignment start on an even doubleword. Returns: HFA in f1..f8, other
+** aggregates of up to 16 bytes in r3,r4, larger ones through a hidden
+** pointer in r3. Complex is an HFA of two elements (f1,f2 both ways).
+*/
+
+#define CCALL_PPC64_AGG_NYI	0xffffffffu
+
+#ifdef LJ_TEST_BREAK_AGG_RET
+/* Negative control: return every aggregate by reference (the ppc32 rule). */
+#define CCALL_HANDLE_STRUCTRET \
+  cc->retref = 1; \
+  cc->gpr[ngpr++] = (GPRArg)dp;
+#else
+#define CCALL_HANDLE_STRUCTRET \
+  { \
+    unsigned int cl = ccall_classify_struct(cts, ctr); \
+    if (cl == CCALL_PPC64_AGG_NYI) goto err_nyi; \
+    cc->retref = (cl == 0 && sz > 16); \
+    if (cc->retref) cc->gpr[ngpr++] = (GPRArg)dp; \
+  }
+#endif
+
+#define CCALL_HANDLE_STRUCTRET2 \
+  ccall_struct_ret_ppc64(cc, ccall_classify_struct(cts, ctr), dp, ctr->size);
+
+#define CCALL_HANDLE_COMPLEXRET \
+  cc->retref = 0;  /* Complex values are returned in f1,f2. */
+
+#define CCALL_HANDLE_COMPLEXRET2 \
+  ccall_struct_ret_ppc64(cc, (2u << 8) | (ctr->size >> 1), dp, ctr->size);
+
+#ifdef LJ_TEST_BREAK_AGG_BYREF
+/* Negative control: pass every struct by reference (the ppc32 rule). */
+#define CCALL_HANDLE_STRUCTARG \
+  rp = cdataptr(lj_cdata_new(cts, did, sz)); \
+  sz = CTSIZE_PTR;
+#else
+#define CCALL_HANDLE_STRUCTARG \
+  { \
+    unsigned int cl = ccall_classify_struct(cts, d); \
+    if (cl == CCALL_PPC64_AGG_NYI) goto err_nyi; \
+    hfan = cl >> 8; hfaes = cl & 255; \
+    isfp = 2;  /* Aggregate: placed by doubleword in CCALL_HANDLE_REGARG. */ \
+  }
+#endif
+
+#ifdef LJ_TEST_BREAK_CPLX_SPLIT
+/* Negative control: pass complex as a two-element HFA (the AAPCS64 rule). */
+#define CCALL_HANDLE_COMPLEXARG \
+  hfan = 2; hfaes = sz >> 1; \
+  isfp = 2;
+#else
+/* Complex is split into two scalar FP arguments, each owning a doubleword
+** (GCC's TARGET_SPLIT_COMPLEX_ARG; measured: an int after a complex float
+** is in r5, and past f13 the imaginary part is a float in the low half of
+** its own doubleword). Placed after conversion, see below.
+*/
+#define CCALL_HANDLE_COMPLEXARG \
+  hfan = 0; hfaes = sz >> 1; \
+  isfp = 3;
+#endif
+
+#define CCALL_HANDLE_GPR \
+  if (ngpr + n <= maxgpr) { \
+    dp = &cc->gpr[ngpr]; \
+    ngpr += n; \
+    goto done; \
+  }
+
+/* Aggregates with 16-byte alignment start on an even doubleword -- but only
+** aggregates that are not homogeneous FP aggregates: GCC places an
+** __attribute__((aligned(16))) struct of two doubles in f1,f2 with its
+** doublewords at the next free slot, and the argument after it one slot
+** later, while the same attribute on {int a,b} or {__int128} skips a slot
+** (measured, tests/luajit/aggregates/probe rows s_2d16.ret_iS, s_al16.ret_iS,
+** s_q.ret_iS).
+*/
+#ifdef LJ_TEST_BREAK_AGG_ALIGN16
+#define CCALL_PPC64_AGG_ALIGN16(d)	0  /* Negative control. */
+#else
+#define CCALL_PPC64_AGG_ALIGN16(d)	(hfan == 0 && ctype_align((d)->info) > 3)
+#endif
+
+/* ELFv2: FP arguments are passed in FPRs, but reserve a GPR or a parameter
+** save area slot, too. Vararg arguments are always passed in GPRs.
+*/
+#define CCALL_HANDLE_REGARG \
+  if (isfp == 3) {  /* Complex: convert to a temp, split at done: below. */ \
+    dp = cplxbuf; \
+    goto done; \
+  } else if (isfp == 2) {  /* Aggregate: doubleword image in gpr[]/stack[]. */ \
+    dp = ccall_agg_arg_ppc64(cc, &ngpr, &nsp, sz, CCALL_PPC64_AGG_ALIGN16(d)); \
+    if (!dp) goto err_nyi;  /* Too many arguments. */ \
+    goto done; \
+  } else if (isva) {  /* Only GPRs are used for vararg arguments. */ \
+    CCALL_HANDLE_GPR \
+  } else if (isfp) {  /* Try to pass argument in FPRs. */ \
+    if (nfpr + 1 <= CCALL_NARG_FPR) { \
+      dp = &cc->fpr[nfpr]; \
+      nfpr += 1; \
+      d = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */ \
+      if (ngpr + 1 <= maxgpr) \
+	ngpr += 1;  /* Reserve a GPR. */ \
+      else if (nsp + CTSIZE_PTR <= CCALL_SIZE_STACK) \
+	nsp += CTSIZE_PTR;  /* Or reserve a save area slot. */ \
+      else \
+	goto err_nyi;  /* Too many arguments. */ \
+      goto done; \
+    } \
+  } else { \
+    CCALL_HANDLE_GPR \
+  }
+
+#define CCALL_HANDLE_RET \
+  if (ctype_isfp(ctr->info) && ctr->size == sizeof(float)) \
+    ctr = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */
+
+#else
+/* -- PPC32 SysV -- */
+
 #define CCALL_HANDLE_STRUCTRET \
   cc->retref = 1;  /* Return all structs by reference. */ \
   cc->gpr[ngpr++] = (GPRArg)dp;
@@ -407,30 +540,7 @@
     goto done; \
   } \
 
-#if LJ_ARCH_PPC64
-/* ELFv2: FP arguments are passed in FPRs, but reserve a GPR or a parameter
-** save area slot, too. Vararg arguments are always passed in GPRs.
-*/
-#define CCALL_HANDLE_REGARG \
-  if (isva) {  /* Only GPRs are used for vararg arguments. */ \
-    CCALL_HANDLE_GPR \
-  } else if (isfp) {  /* Try to pass argument in FPRs. */ \
-    if (nfpr + 1 <= CCALL_NARG_FPR) { \
-      dp = &cc->fpr[nfpr]; \
-      nfpr += 1; \
-      d = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */ \
-      if (ngpr + 1 <= maxgpr) \
-	ngpr += 1;  /* Reserve a GPR. */ \
-      else if (nsp + CTSIZE_PTR <= CCALL_SIZE_STACK) \
-	nsp += CTSIZE_PTR;  /* Or reserve a save area slot. */ \
-      else \
-	goto err_nyi;  /* Too many arguments. */ \
-      goto done; \
-    } \
-  } else { \
-    CCALL_HANDLE_GPR \
-  }
-#elif LJ_ABI_SOFTFP
+#if LJ_ABI_SOFTFP
 #define CCALL_HANDLE_REGARG  CCALL_HANDLE_GPR
 #else
 #define CCALL_HANDLE_REGARG \
@@ -450,6 +560,8 @@
 #define CCALL_HANDLE_RET \
   if (ctype_isfp(ctr->info) && ctr->size == sizeof(float)) \
     ctr = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */
+#endif
+
 #endif
 
 #elif LJ_TARGET_MIPS32
@@ -952,6 +1064,133 @@ static void ccall_copy_struct(CCallState *cc, CType *ctr, void *dp, void *sp,
 
 #endif
 
+/* -- PPC64 ELFv2 ABI aggregate classification ---------------------------- */
+
+#if LJ_TARGET_PPC && LJ_64
+
+/* gpr[] and stack[] must form one contiguous parameter save area image. */
+LJ_STATIC_ASSERT(offsetof(CCallState, stack) ==
+		 offsetof(CCallState, gpr) + CCALL_NUM_GPR*sizeof(GPRArg));
+
+/* Accumulate the element kind bits (4: float, 8: double, 16: vector or
+** long double) and the element count of an aggregate, the way GCC's
+** rs6000_aggregate_candidate does; a complex member counts as two elements.
+** Returns 0 as soon as a member that can never be part of a homogeneous
+** aggregate is seen (integer, pointer, enum, bool, bitfield, flexible array).
+*/
+static int ccall_agg_elts_ppc64(CTState *cts, CType *ct,
+				unsigned int *rp, unsigned int *np)
+{
+  unsigned int r = 0, n = 0, isu = (ct->info & CTF_UNION);
+  while (ct->sib) {
+    unsigned int m = 1, sr = 0, sn = 0;
+    CType *sct;
+    ct = ctype_get(cts, ct->sib);
+    if (ctype_isfield(ct->info)) {
+      sct = ctype_rawchild(cts, ct);
+      if (ctype_isarray(sct->info) && !sct->size) return 0;
+      /* A vector is CT_ARRAY|CTF_VECTOR: stop before descending into its
+      ** element type, or {int v __attribute__((vector_size(16)))} reads as
+      ** four ints and goes to the GPRs while GCC puts it in v2.
+      */
+      while (ctype_isarray(sct->info) && !ctype_isvector(sct->info)) {
+	CType *cct = ctype_rawchild(cts, sct);
+	m *= sct->size / cct->size;
+	sct = cct;
+      }
+      if (ctype_isvector(sct->info)) {
+	sr = 16; sn = 1;
+      } else if (ctype_iscomplex(sct->info)) {
+	/* A complex member is two FP elements: GCC passes {double _Complex c}
+	** in f1,f2 and a double after it in f3. Complex is CT_ARRAY too, so
+	** the array descent above reaches the same result; keep it explicit.
+	*/
+	sr = sct->size >> 1; sn = 2;
+      } else if (ctype_isfp(sct->info)) {
+	sr = sct->size > 8 ? 16 : sct->size; sn = 1;
+      } else if (ctype_isstruct(sct->info)) {
+	if (!ccall_agg_elts_ppc64(cts, sct, &sr, &sn)) return 0;
+      } else {
+	return 0;
+      }
+    } else if (ctype_isbitfield(ct->info) && ctype_bitbsz(ct->info)) {
+      return 0;
+    } else if (ctype_isxattrib(ct->info, CTA_SUBTYPE)) {
+      if (!ccall_agg_elts_ppc64(cts, ctype_rawchild(cts, ct), &sr, &sn))
+	return 0;
+    } else {
+      continue;
+    }
+    sn *= m;
+    r |= sr;
+    if (!isu) n += sn; else if (n < sn) n = sn;
+    if (n > 8) break;  /* More than 8 elements: an other aggregate anyway. */
+  }
+  *rp = r; *np = n;
+  return 1;
+}
+
+/* Classify an aggregate. Returns (n << 8) | eltsize for a homogeneous
+** float or double aggregate of n <= 8 elements whose size is exactly
+** n*eltsize (GCC's padding rule), 0 for every other aggregate (passed and
+** returned in doublewords), or CCALL_PPC64_AGG_NYI for a homogeneous vector
+** or long double aggregate, which would travel in v2..v13 or FPR pairs that
+** this port does not load.
+*/
+static unsigned int ccall_classify_struct(CTState *cts, CType *ct)
+{
+  unsigned int r = 0, n = 0;
+#ifdef LJ_TEST_BREAK_HFA
+  return 0;  /* Negative control: no aggregate is homogeneous. */
+#endif
+  if (!ccall_agg_elts_ppc64(cts, ct, &r, &n) || n == 0 || n > 8)
+    return 0;
+  if (ct->size != n * r) return 0;  /* Padding or mixed element sizes. */
+  if (r == 16) return CCALL_PPC64_AGG_NYI;
+  return (n << 8) | r;
+}
+
+/* Reserve the doublewords of an aggregate argument in the parameter save
+** area image and return where its bytes go, or NULL if it does not fit.
+*/
+static void *ccall_agg_arg_ppc64(CCallState *cc, MSize *ngprp, MSize *nspp,
+				 CTSize sz, int align16)
+{
+  MSize ngpr = *ngprp, nsp = *nspp, p;
+  MSize w = (sz + CTSIZE_PTR-1) / CTSIZE_PTR;
+  lj_assertX(ngpr == CCALL_NARG_GPR || nsp == 0, "stack args before GPRs");
+  p = ngpr < CCALL_NARG_GPR ? ngpr : CCALL_NARG_GPR + nsp / CTSIZE_PTR;
+  if (align16) p = (p + 1u) & ~1u;  /* Even doubleword. */
+  if (p + w > CCALL_NARG_GPR + CCALL_NUM_STACK) return NULL;
+  if (p + w <= CCALL_NARG_GPR) {
+    ngpr = p + w;
+  } else {
+    ngpr = CCALL_NARG_GPR;
+    nsp = (p + w - CCALL_NARG_GPR) * CTSIZE_PTR;
+  }
+  *ngprp = ngpr; *nspp = nsp;
+  /* Derived from the CCallState object, not gpr[]: it runs on into stack[]. */
+  return (uint8_t *)cc + offsetof(CCallState, gpr) + p * CTSIZE_PTR;
+}
+
+/* Copy a returned aggregate out of the result registers. */
+static void ccall_struct_ret_ppc64(CCallState *cc, unsigned int cl,
+				   uint8_t *dp, CTSize sz)
+{
+  if (cl) {  /* HFA: one element per FPR, f1..f8. */
+    MSize i, n = cl >> 8;
+    if ((cl & 255) == 4) {
+      for (i = 0; i < n; i++) ((float *)dp)[i] = (float)cc->fpr[i];
+    } else {
+      for (i = 0; i < n; i++) ((double *)dp)[i] = cc->fpr[i];
+    }
+  } else {
+    memcpy(dp, cc->gpr, sz);  /* r3,r4 hold the memory image. */
+  }
+}
+
+#endif
+
 #ifndef ccall_struct_align
 /* Alignment of pass-by-value structs. */
 #define ccall_struct_align(cts, ct)	((ct)->info & CTF_ALIGN)
@@ -1074,6 +1313,10 @@ static int ccall_set_args(lua_State *L, CTState *cts, CType *ct,
 #if LJ_TARGET_X64 && !LJ_ABI_WIN
     int onstack = 0;
 #endif
+#if LJ_TARGET_PPC && LJ_64
+    MSize hfan = 0, hfaes = 0;  /* HFA element count and size. */
+    GPRArg cplxbuf[2];  /* Complex value before it is split. */
+#endif
 
     if (fid) {  /* Get argument type from field. */
       CType *ctf = ctype_get(cts, fid);
@@ -1195,6 +1438,32 @@ static int ccall_set_args(lua_State *L, CTState *cts, CType *ct,
       /* Split float HFA or complex float into separate registers. */
       CTSize i = (sz >> 2) - 1;
       do { ((uint64_t *)dp)[i] = ((uint32_t *)dp)[i]; } while (i--);
+    }
+#elif LJ_TARGET_PPC && LJ_64
+    if (isfp == 3) {  /* Complex: two scalar FP arguments. */
+      MSize k;
+      for (k = 0; k < 2; k++) {
+	double v = hfaes == 4 ? (double)((float *)dp)[k] : ((double *)dp)[k];
+	void *slot;
+	if (ngpr < maxgpr) {
+	  slot = &cc->gpr[ngpr++];  /* Every part reserves a doubleword. */
+	} else if (nsp + CTSIZE_PTR <= CCALL_SIZE_STACK) {
+	  slot = (uint8_t *)cc->stack + nsp; nsp += CTSIZE_PTR;
+	} else {
+	  goto err_nyi;  /* Too many arguments. */
+	}
+	if (!isva && nfpr < CCALL_NARG_FPR)
+	  cc->fpr[nfpr++] = v;  /* FPRs always hold doubles. */
+	else if (hfaes == 4)
+	  *(float *)slot = (float)v;  /* Low half of the doubleword (LE). */
+	else
+	  *(double *)slot = v;
+      }
+    } else if (hfan) {  /* HFA: leading elements go to f1..f13 as far as they last. */
+      MSize i;
+      for (i = 0; i < hfan && nfpr < CCALL_NARG_FPR; i++)
+	cc->fpr[nfpr++] = hfaes == 4 ? (double)((float *)dp)[i] :
+					((double *)dp)[i];
     }
 #else
     UNUSED(isfp);

@@ -2861,13 +2861,22 @@ static void build_subroutines(BuildCtx *ctx)
   |  ld TMP2, -8(r14)
   |   ld TMP0, 16(r14)
   |   ld TOCREG, 24(r14)
+  |  // ELFv2 results: r3,r4 (scalars and other aggregates <= 16 bytes),
+  |  // f1..f8 (scalars, complex and homogeneous FP aggregates).
   |  std CARG1, CCSTATE:TMP1->gpr[0]
   |  stfd FARG1, CCSTATE:TMP1->fpr[0]
   |  std CARG2, CCSTATE:TMP1->gpr[1]
   |   mtlr TMP0
-  |  std CARG3, CCSTATE:TMP1->gpr[2]
+  |.if not VMRETBREAK   // negative control: make DASM_XFLAGS="-D VMRETBREAK"
+  |  stfd f2, CCSTATE:TMP1->fpr[1]
+  |  stfd f3, CCSTATE:TMP1->fpr[2]
+  |  stfd f4, CCSTATE:TMP1->fpr[3]
+  |  stfd f5, CCSTATE:TMP1->fpr[4]
+  |  stfd f6, CCSTATE:TMP1->fpr[5]
+  |  stfd f7, CCSTATE:TMP1->fpr[6]
+  |  stfd f8, CCSTATE:TMP1->fpr[7]
+  |.endif
   |   mr sp, r14
-  |  std CARG4, CCSTATE:TMP1->gpr[3]
   |   mr r14, TMP2
   |  blr
   |.endif
