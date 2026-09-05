@@ -127,6 +127,15 @@
 |// otherwise destroy the C frame record.  Hence the C frame info and the two
 |// conversion temps sit ABOVE the register saves, not in 32..95.
 |.define SAVE_LR,	480(sp)
+|// ELFv2: 8(sp) and 16(sp) of *our own* frame are the linkage-area CR and LR
+|// save words that *our callees* write into -- a C prologue does
+|// `stw r12, 8(r1)` and `std r0, 16(r1)` against its caller's sp, which is
+|// ours.  The slots we own are the matching ones in our caller's frame, at
+|// CFRAME_SPACE+8 and CFRAME_SPACE+16.  SAVE_LR already uses CFRAME_SPACE+16;
+|// SAVE_CR must use CFRAME_SPACE+8 and not 8(sp), or every C helper that
+|// itself uses a non-volatile CR field (CR2-CR4) overwrites our saved CR and
+|// restoreregs hands the caller back a corrupted CR.
+|.define SAVE_CR,	472(sp)	// 64 bit CR save (caller's CR save word).
 |.define CFRAME_SPACE,	464	// Delta for sp.
 |// Back chain for sp:	464(sp)	<-- sp entering interpreter
 |.define SAVE_ERRF,	456(sp)	// |
@@ -144,9 +153,9 @@
 |//			96(sp)	// .. 111: free = JIT spill slots 24..27 (SPS_FIXED).
 |//			32(sp)	// .. 95: callee parameter save area (ABI mandated);
 |//				// callee-scratch, keep nothing here.
-|.define SAVE_TOC,	24(sp)	// TOC save area.
-|// Next frame lr:	16(sp)
-|.define SAVE_CR,	8(sp)	// 64 bit CR save.
+|.define SAVE_TOC,	24(sp)	// TOC save area (ours: we are the caller).
+|// Next frame lr:	16(sp)	// written by our callees -- do not use.
+|// Next frame cr:	8(sp)	// written by our callees -- do not use.
 |// Back chain for sp:	0(sp)   <-- sp while in interpreter
 |
 |.define TMPD_BLO,	408(sp)	// LSB
