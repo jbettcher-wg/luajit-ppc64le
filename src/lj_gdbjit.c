@@ -379,8 +379,10 @@ static const ELFheader elfhdr_template = {
   .machine = 40,
 #elif LJ_TARGET_ARM64
   .machine = 183,
+#elif LJ_TARGET_PPC && LJ_64
+  .machine = 21,			/* EM_PPC64. */
 #elif LJ_TARGET_PPC
-  .machine = 20,
+  .machine = 20,			/* EM_PPC. */
 #elif LJ_TARGET_MIPS
   .machine = 8,
 #else
@@ -390,7 +392,14 @@ static const ELFheader elfhdr_template = {
   .entry = 0,
   .phofs = 0,
   .shofs = offsetof(GDBJITobj, sect),
+#if LJ_TARGET_PPC && LJ_64
+  /* PPC64 e_flags[0:1] is the ABI version. 0 means "unspecified", which makes
+  ** GDB fall back to the ELFv1 function-descriptor model. ppc64le is ELFv2.
+  */
+  .flags = LJ_LE ? 2 : 1,  /* ELFv2 on ppc64le, ELFv1 on ppc64be. */
+#else
   .flags = 0,
+#endif
   .ehsize = sizeof(ELFheader),
   .phentsize = 0,
   .phnum = 0,

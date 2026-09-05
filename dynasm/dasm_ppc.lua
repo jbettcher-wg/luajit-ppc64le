@@ -710,6 +710,7 @@ map_op = {
   popcntd_2 =	"7c0003f4RR~",
   cmpb_3 =	"7c0003f8RR~R.",
   mcrxr_1 =	"7c000400X",
+  mcrxrx_1 =	"7c000480X",	-- ISA 3.0: cr = OV||OV32||CA||CA32.
   lbdx_3 =	"7c000406RRR",
   subfco_3 =	"7c000410RRR.",
   subco_3 =	"7c000410RRR~.",
@@ -1719,13 +1720,14 @@ op_template = function(params, template, nparams)
       op = op + parse_cr(params[n]); n = n + 1
     elseif p == "G" then
       op = op + parse_imm(params[n], 8, 12, 0, false); n = n + 1
-    elseif p == "H" then
-      v = parse_imm(params[n], 6, 0, 0, false);
-      op = op + shl(band(v,31), 11)+shl(shr(v,5), 1);
-      n = n + 1;
-    elseif p == "f" then
-      v = tonumber(params[n]);
-      op = op + shl(band(v,31), 11)+shl(shr(v,5), 1);
+    elseif p == "H" or p == "f" then
+      -- MD/MDS-form (rldicl etc.) and XS-form (sradi) 6-bit shift amount:
+      -- sh[0:4] goes to bits 11-15, sh[5] to bit 1. parse_shiftmask() knows
+      -- how to split both a literal and a symbolic operand -- the latter via
+      -- the DASM_IMMSH action. Do NOT open-code the split on the result of
+      -- parse_imm(): for a non-literal that returns 0 and emits a DASM_IMM
+      -- action which deposits the whole 6-bit value at bit 0.
+      op = op + parse_shiftmask(params[n], true); n = n + 1
     elseif p == "M" then
       op = op + parse_shiftmask(params[n], false); n = n + 1
     elseif p == "J" or p == "K" then

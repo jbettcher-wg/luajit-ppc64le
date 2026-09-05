@@ -1154,13 +1154,25 @@ static int ccall_set_args(lua_State *L, CTState *cts, CType *ct,
     if (isfp && d->size == sizeof(float))
       ((float *)dp)[1] = ((float *)dp)[0];  /* Floats occupy high slot. */
 #endif
-#if LJ_TARGET_MIPS64 || (LJ_TARGET_ARM64 && LJ_BE)
+#if LJ_TARGET_MIPS64 || (LJ_TARGET_ARM64 && LJ_BE) || (LJ_TARGET_PPC && LJ_64)
     if ((ctype_isinteger_or_bool(d->info) || ctype_isenum(d->info)
 #if LJ_TARGET_MIPS64
 	 || (isfp && nsp == 0)
 #endif
 	 ) && d->size <= 4) {
+#if LJ_TARGET_PPC && LJ_64
+      /* ELFv2 requires the *caller* to extend sub-doubleword integer
+      ** arguments to 64 bits; callees do not re-extend (GCC emits a bare
+      ** blr for long f(int a){return a;}). Signed types are sign-extended,
+      ** unsigned types zero-extended -- unlike n64, which sign-extends both.
+      */
+      if ((d->info & CTF_UNSIGNED))
+	*(uint64_t *)dp = (uint64_t)*(uint32_t *)dp;
+      else
+	*(int64_t *)dp = (int64_t)*(int32_t *)dp;
+#else
       *(int64_t *)dp = (int64_t)*(int32_t *)dp;  /* Sign-extend to 64 bit. */
+#endif
     }
 #endif
 #if LJ_TARGET_X64 && LJ_ABI_WIN

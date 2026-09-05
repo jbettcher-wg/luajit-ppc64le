@@ -371,7 +371,11 @@
 #define LJ_ARCH_NOJIT		1	/* NYI */
 #endif
 
-#if _ARCH_PWR7
+#if _ARCH_PWR9
+#define LJ_ARCH_VERSION		90
+#elif _ARCH_PWR8
+#define LJ_ARCH_VERSION		80
+#elif _ARCH_PWR7
 #define LJ_ARCH_VERSION		70
 #elif _ARCH_PWR6
 #define LJ_ARCH_VERSION		60

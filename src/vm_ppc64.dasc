@@ -29,10 +29,38 @@
 |  addil  r2, r2,  extern .TOC.-lj_..target_name@l
 |.endmacro
 |
-|.macro checkov, noov
-|  mcrxr cr0
-|  bley noov
+|// Clear the whole of XER, in particular the *sticky* summary-overflow bit.
+|// Every OE-form instruction ORs its OV into XER.SO and copies XER.SO (not
+|// its own OV) into CR0.SO, so a stale SO makes every later `bso' fire.
+|.macro clearxer
+|  li TMP0, 0
+|  mtxer TMP0
 |.endmacro
+|
+|// Called after a `bso' taken on an OE-form instruction. Distinguishes a real
+|// overflow of *that* instruction (XER.OV) from a stale sticky XER.SO left by
+|// an earlier one, and clears XER either way. Branches to noov if there was no
+|// real overflow.
+|//
+|// This used to be the ppc32 "move XER to CR" idiom, which was dropped in ISA
+|// 2.06 and is trapped and kernel-emulated on POWER8/POWER9 at ~215 ns per
+|// execution (handbook Appendix A.1), ~1000x every alternative, so it must not
+|// appear anywhere. Both replacements below must clear XER by hand: the old
+|// instruction did that implicitly, mfxer and mcrxrx do not.
+|.if VER >= 90
+|.macro checkov, noov
+|  mcrxrx cr0			// ISA 3.0. cr0: LT=OV GT=OV32 EQ=CA SO=CA32.
+|  clearxer			// mcrxrx does NOT clear XER. The old one did.
+|  bgey noov			// cr0.LT (=XER.OV) clear: no real overflow.
+|.endmacro
+|.else
+|.macro checkov, noov
+|  mfxer TMP0			// ISA 2.07 baseline (POWER8).
+|  andis. TMP0, TMP0, 0x4000	// Test XER.OV (bit 33). Sets cr0; li/mtxer don't.
+|  clearxer
+|  beqy noov			// XER.OV clear: no real overflow.
+|.endmacro
+|.endif
 |
 |//-----------------------------------------------------------------------
 |
@@ -2262,7 +2290,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  cmpdi CARG2, 0
   |   li CARG1, 0
   |  beqlr
-  |  mcrxr cr0			// Clear SO for -2147483648 % -1 and return 0.
+  |  clearxer			// Clear SO for -2147483648 % -1 and return 0.
   |  blr
   |
   |//-----------------------------------------------------------------------
