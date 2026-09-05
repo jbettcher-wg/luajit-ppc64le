@@ -3566,10 +3566,19 @@ static void asm_hiop(ASMState *as, IRIns *ir)
 
 /* -- Profiling ----------------------------------------------------------- */
 
+/* PPC64: unchanged from ppc32. hookmask is a uint8_t (lbz off JGL through
+** emit_lsglptr, the narrow-field form), andi. sets cr0 (PPC_CRF_CMP), the
+** guard exits when HOOK_PROFILE is set so lj_trace_exit hands the sample
+** to the profiler.
+*/
 static void asm_prof(ASMState *as, IRIns *ir)
 {
   UNUSED(ir);
+#ifdef LJ_TEST_BREAK_PROF
+  asm_guardcc(as, CC_EQ);  /* Control (Phase 5): exits when NOT profiling. */
+#else
   asm_guardcc(as, CC_NE);
+#endif
   emit_asi(as, PPCI_ANDIDOT, RID_TMP, RID_TMP, HOOK_PROFILE);
   emit_lsglptr(as, PPCI_LBZ, RID_TMP,
 	       (int32_t)offsetof(global_State, hookmask));
@@ -3754,7 +3763,15 @@ static void asm_gc_check(ASMState *as)
   tmp = ra_releasetmp(as, ASMREF_TMP2);
   emit_loadi(as, tmp, as->gcsteps);
   /* Jump around GC step if GC total < GC threshold. */
+#ifdef LJ_TEST_BREAK_GCCHECK
+  /* Control (Phase 5): inverted sense -- the step runs only while the heap
+  ** is *below* its threshold and never once it is above, so an allocating
+  ** loop that never leaves its trace grows the heap without bound.
+  */
+  emit_condbranch(as, PPCI_BC|PPCF_Y, CC_GE, l_end);
+#else
   emit_condbranch(as, PPCI_BC|PPCF_Y, CC_LT, l_end);
+#endif
   emit_ab(as, LJ_GC64 ? PPCI_CMPLD : PPCI_CMPLW, RID_TMP, tmp);  /* GCSize. */
   emit_getgl(as, tmp, gc.threshold);
   emit_getgl(as, RID_TMP, gc.total);
@@ -3795,9 +3812,21 @@ static void asm_loop_tail_fixup(ASMState *as)
 ** never tests SO and never gets this. LJ_TEST_BREAK_XERCLR omits it: a
 ** stale SO planted before the entry then exits the trace at its first
 ** overflow guard, on every entry.
+**
+** Side traces (Phase 5, C27): a side trace attached to a bso exit is
+** entered with SO *set* -- that is why the parent exited -- so it depends
+** on this clear exactly as ppc32 depended on the mcrxr that
+** lj_asm_patchexit prepended. LJ_TEST_BREAK_XERCLR_SIDE omits the clear
+** in side-trace heads only: a side trace with its own SO guard, reached
+** from a real overflow, then mis-exits at that guard on every entry.
 */
-static void asm_head_clearxer(ASMState *as)
+static void asm_head_clearxer(ASMState *as, int side)
 {
+#ifdef LJ_TEST_BREAK_XERCLR_SIDE
+  if (side) return;
+#else
+  UNUSED(side);
+#endif
 #ifndef LJ_TEST_BREAK_XERCLR
   if (as->xerclr) {
     emit_tab(as, PPCI_MTXER, RID_TMP, 0, 0);
@@ -3808,7 +3837,7 @@ static void asm_head_clearxer(ASMState *as)
 #endif
 }
 #else
-#define asm_head_clearxer(as)	UNUSED(as)
+#define asm_head_clearxer(as, side)	UNUSED(as)
 #endif
 
 /* Coalesce BASE register for a root trace. */
@@ -3816,7 +3845,7 @@ static void asm_head_root_base(ASMState *as)
 {
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
-  asm_head_clearxer(as);
+  asm_head_clearxer(as, 0);
   if (ra_hasreg(r)) {
     ra_free(as, r);
     if (rset_test(as->modset, r) || irt_ismarked(ir->t))
@@ -3831,7 +3860,7 @@ static Reg asm_head_side_base(ASMState *as, IRIns *irp)
 {
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
-  asm_head_clearxer(as);
+  asm_head_clearxer(as, 1);
   if (ra_hasreg(r)) {
     ra_free(as, r);
     if (rset_test(as->modset, r) || irt_ismarked(ir->t))
@@ -3964,10 +3993,17 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
 {
   MCode *p = T->mcode;
   MCode *pe = (MCode *)((char *)p + T->szmcode);
-  MCode *px = exitstub_trace_addr(T, exitno);
+  MCode *px;
   MCode *cstart = NULL;
   MCode *mcarea = lj_mcode_patch(J, p, 0);
   int patchlong = 1;
+#ifdef LJ_TEST_BREAK_PATCHEXIT
+  /* Control (Phase 5): redirect the neighbouring exit instead of the one
+  ** the side trace was compiled for.
+  */
+  exitno = (ExitNo)((exitno + 1) % T->nsnap);
+#endif
+  px = exitstub_trace_addr(T, exitno);
   for (; p < pe; p++) {
     /* Look for exitstub branch, try to replace with branch to target. */
     uint32_t ins = *p;
@@ -4072,13 +4108,11 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
    asm_comp asm_equal asm_conv asm_tobit asm_hiop
    asm_mul asm_neg asm_abs asm_fpdiv asm_fpmath asm_addov asm_subov asm_mulov
    asm_bnot asm_bswap asm_band asm_bor asm_bxor asm_bshl asm_bshr asm_bsar
-   asm_brol asm_min asm_max asm_strto */
+   asm_brol asm_min asm_max asm_strto asm_prof */
 
 #if LJ_ARCH_PPC64
 /* BEGIN GENERATED: lj_ppc64_nyi_gen.py -- do not edit by hand. */
 #undef asm_bror
 #define asm_bror(as, ir)	asm_nyi64((as), (ir), NULL)
-#undef asm_prof
-#define asm_prof(as, ir)	asm_nyi64((as), (ir), (const void *)asm_prof)
 /* END GENERATED */
 #endif

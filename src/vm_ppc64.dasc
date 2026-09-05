@@ -1794,7 +1794,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  blt ->fff_fallback
   |  checknum_noclear CARG1; bge ->fff_fallback
   |  checknum_noclear CARG2; bne ->fff_fallback
-  |  std CARG1, 0(BASE)
+  |  extsw CARG2, CARG2		// int exp: the caller extends (ELFv2, D3).
   |  lfd FARG1, 0(BASE)
   |  std TOCREG, SAVE_TOC
   |  blex ldexp
