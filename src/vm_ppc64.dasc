@@ -2126,7 +2126,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  bne >3
   |  lwz INS, -4(PC)
   |  decode_RA8 TMP1, INS
-  |  addi TMP1, TMP1, 8
+  |  addi TMP1, TMP1, 16		// FR2: two-slot frame link.
   |3:
   |  sub TMP2, BASE, TMP1
   |  b ->vm_call_dispatch		// Resolve again for tailcall.
@@ -3945,7 +3945,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |     addis TMP3, PC, -(BCBIAS_J*4 >> 16)
     |  stfd f0, 8(RA)
     |     decode_RD4 TMP1, INS
-    |    std RC, -8(RA)			// Update control var.
+    |    stw RC, -8(RA)			// Update control var (low word; keep LJ_KEYINDEX in high word).
     |     add PC, TMP1, TMP3
     |3:
     |  ins_next
@@ -3978,7 +3978,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   stfd f1, 0(RA)
     |    addi RC, RC, 1
     |     add PC, TMP1, TMP2
-    |    std RC, -8(RA)			// Update control var.
+    |    stw RC, -8(RA)			// Update control var (low word; keep LJ_KEYINDEX in high word).
     |  b <3
     |
     |7:  // Skip holes in hash part.
