@@ -73,7 +73,7 @@ static MSize CALLBACK_OFS2SLOT(MSize ofs)
 #elif LJ_TARGET_PPC
 
 #if LJ_ARCH_PPC64
-#define CALLBACK_MCODE_HEAD		40
+#define CALLBACK_MCODE_HEAD		48
 #else  /* PPC 32bits */
 #define CALLBACK_MCODE_HEAD		24
 #endif
@@ -220,15 +220,24 @@ static void *callback_mcode_init(global_State *g, uint32_t *page)
   void *target = (void *)lj_vm_ffi_callback;
   MSize slot;
 #if LJ_ARCH_PPC64
-  // Store on R0 the global state and point R12 to the function so TOC is calculated correctly.
-  *p++ = PPCI_LI | PPCF_T(RID_R12) | ((((intptr_t)target) >> 32) & 0xffff);
-  *p++ = PPCI_LI | PPCF_T(RID_TMP) | ((((intptr_t)g) >> 32) & 0xffff);
+  /* Store the global state in R0 and point R12 at the target, so the ELFv2
+  ** global entry point can compute its TOC from R12.
+  **
+  ** Materialize the full 64 bits of each address. The lis/ori/sldi/oris/ori
+  ** sequence is the only correct one: a leading `li` would sign-extend bit 47
+  ** and drop bits 48-63 entirely. Both are latent on current Linux (user
+  ** addresses stay below 2^47), but not something to rely on.
+  */
+  *p++ = PPCI_LIS | PPCF_T(RID_R12) | ((((uintptr_t)target) >> 48) & 0xffff);
+  *p++ = PPCI_LIS | PPCF_T(RID_TMP) | ((((uintptr_t)g) >> 48) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_R12) | PPCF_T(RID_R12) | ((((uintptr_t)target) >> 32) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_TMP) | PPCF_T(RID_TMP) | ((((uintptr_t)g) >> 32) & 0xffff);
   *p++ = PPCI_RLDICR | PPCF_T(RID_R12) | PPCF_A(RID_R12) | PPCF_SH(32) | PPCF_M6(63-32);  /* sldi */
   *p++ = PPCI_RLDICR | PPCF_T(RID_TMP) | PPCF_A(RID_TMP) | PPCF_SH(32) | PPCF_M6(63-32);  /* sldi */
-  *p++ = PPCI_ORIS | PPCF_A(RID_R12) | PPCF_T(RID_R12) | ((((intptr_t)target) >> 16) & 0xffff);
-  *p++ = PPCI_ORIS | PPCF_A(RID_TMP) | PPCF_T(RID_TMP) | ((((intptr_t)g) >> 16) & 0xffff);
-  *p++ = PPCI_ORI | PPCF_A(RID_R12) | PPCF_T(RID_R12) | (((intptr_t)target) & 0xffff);
-  *p++ = PPCI_ORI | PPCF_A(RID_TMP) | PPCF_T(RID_TMP) | (((intptr_t)g) & 0xffff);
+  *p++ = PPCI_ORIS | PPCF_A(RID_R12) | PPCF_T(RID_R12) | ((((uintptr_t)target) >> 16) & 0xffff);
+  *p++ = PPCI_ORIS | PPCF_A(RID_TMP) | PPCF_T(RID_TMP) | ((((uintptr_t)g) >> 16) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_R12) | PPCF_T(RID_R12) | (((uintptr_t)target) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_TMP) | PPCF_T(RID_TMP) | (((uintptr_t)g) & 0xffff);
   *p++ = PPCI_MTCTR | PPCF_T(RID_R12);
 #else  /* PPC 32bits */
   *p++ = PPCI_LIS | PPCF_T(RID_TMP) | (u32ptr(target) >> 16);
