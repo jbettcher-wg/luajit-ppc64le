@@ -129,7 +129,16 @@ enum {
 ** slot count, not the excess over SPS_FIXED.
 */
 #define SPS_FIXED	28
+#ifdef LJ_TEST_BREAK_PSA_RESERVE
+/* Negative control (Phase 6): shrink the reserved parameter save area from
+** 96 to 32 bytes.  Spill slots then start at 32(sp), inside the 8 doublewords
+** an ELFv2 callee owns, and a variadic callee's `std r9,80(r1)' lands on
+** them.  Single variable: nothing else changes.
+*/
+#define SPS_FIRST	8
+#else
 #define SPS_FIRST	24
+#endif
 
 /* Only the LR save slot is scratch. LE: the low word is at the lower address. */
 #define SPOFS_TMPW	16

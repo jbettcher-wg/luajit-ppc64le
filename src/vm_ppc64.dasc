@@ -118,29 +118,38 @@
 |
 |// Stack layout while in interpreter. Must match with lj_frame.h.
 |
-|.define SAVE_LR,	416(sp)
-|.define CFRAME_SPACE,	400	// Delta for sp.
-|// Back chain for sp:	400(sp)	<-- sp entering interpreter
+|// ELFv2: bytes 32..95 of *this* frame are the parameter save area of the
+|// functions we call, and the ABI makes that area callee-scratch -- a
+|// variadic callee stores its incoming r3..r10 there without a frame of its
+|// own (handbook A.2: std r4,40(r1) .. std r10,88(r1)) -- so nothing of ours
+|// may live in it.  A JIT trace runs on this very frame whenever
+|// spadjust == 0, and an ffi.C.printf-style call from such a trace would
+|// otherwise destroy the C frame record.  Hence the C frame info and the two
+|// conversion temps sit ABOVE the register saves, not in 32..95.
+|.define SAVE_LR,	480(sp)
+|.define CFRAME_SPACE,	464	// Delta for sp.
+|// Back chain for sp:	464(sp)	<-- sp entering interpreter
+|.define SAVE_ERRF,	456(sp)	// |
+|.define SAVE_NRES,	448(sp)	// |
+|.define SAVE_L,	440(sp)	//  > 64 bit C frame info.
+|.define SAVE_PC,	432(sp)	// |
+|.define SAVE_MULTRES,	424(sp)	// |
+|.define SAVE_CFRAME,	416(sp)	// / 64 bit C frame chain.
+|.define TMPD_HI,	412(sp)	// \ Conversion temp.
+|.define TMPD_LO,	408(sp)	// /
+|.define TONUM_HI,	404(sp)	// \ Conversion temp (bias: set once at entry).
+|.define TONUM_LO,	400(sp)	// /
 |.define SAVE_FPR_,	256	// .. 256+18*8: 64 bit FPR saves.
 |.define SAVE_GPR_,	112	// .. 112+18*8: 64 bit GPR saves.
-|//			92(sp)	// \ 32 bit C frame info.
-|.define SAVE_ERRF,	88(sp)	// |
-|.define SAVE_NRES,	80(sp)	// |
-|.define SAVE_L,	72(sp)	//  > Parameter save area.
-|.define SAVE_PC,	64(sp)	// |
-|.define SAVE_MULTRES,	56(sp)	// |
-|.define SAVE_CFRAME,	48(sp)	// / 64 bit C frame chain.
-|.define TMPD_HI,	44(sp)	// \ Link editor temp (ABI mandated).
-|.define TMPD_LO,	40(sp)	// /
-|.define TONUM_HI,	36(sp)	// \ Compiler temp (ABI mandated).
-|.define TONUM_LO,	32(sp)	// /
-|//			32(sp)	// Callee parameter save area (ABI mandated).
+|//			96(sp)	// .. 111: free = JIT spill slots 24..27 (SPS_FIXED).
+|//			32(sp)	// .. 95: callee parameter save area (ABI mandated);
+|//				// callee-scratch, keep nothing here.
 |.define SAVE_TOC,	24(sp)	// TOC save area.
 |// Next frame lr:	16(sp)
 |.define SAVE_CR,	8(sp)	// 64 bit CR save.
 |// Back chain for sp:	0(sp)   <-- sp while in interpreter
 |
-|.define TMPD_BLO,	40(sp)	// LSB
+|.define TMPD_BLO,	408(sp)	// LSB
 |.define TMPD,		TMPD_LO	// base address of TMPD doubleword
 |.define TONUM_D,	TONUM_LO// base address of TONUM doubleword
 |
@@ -315,8 +324,21 @@
 |
 |.macro set_bool, reg, type; li TMP4, type; rotldi reg, TMP4, 47; .endmacro
 |
+|// Build an int TValue: (LJ_TISNUM<<47) | (uint32)value.  The payload of an
+|// int is 32 bits, not the 47 of a GCref, so a *negative* int must be
+|// zero-extended from 32 bits and not merely have its tag field cleared:
+|// clrldi 17 leaves bits 32..46 set and produces fff97fff_ffffffff for -1
+|// instead of fff90000_ffffffff.  Such a word is numerically right wherever
+|// only intV() (the low word) is read -- which is why the interpreter never
+|// noticed -- but it is a different 64-bit word, so lj_obj_equal() (hence
+|// lua_rawequal) says two equal integers differ, and the recorder's
+|// rec_check_slots() asserts against the canonical constant the JIT builds.
 |.macro add_oper_type, value, type
+|.if INTCANONBREAK   // negative control: make DASM_XFLAGS="-D INTCANONBREAK"
 |  clear_field value
+|.else
+|  clrldi value, value, 32
+|.endif
 |  add value, value, type
 |.endmacro
 |
@@ -1149,8 +1171,9 @@ static void build_subroutines(BuildCtx *ctx)
   |  bl extern lj_meta_call	// (lua_State *L, TValue *func, TValue *top)
   |  ld TMP1, FRAME_PC(BASE)
   |   addi NARGS8:RC, SAVE0, 8		// Got one more argument now.
-  |   ld LFUNC:RB, FRAME_FUNC(RA)	// Guaranteed to be a function here.
-  |  clear_field RB
+  |   ld CARG1, FRAME_FUNC(RA)	// Guaranteed to be a function here.
+  |  mr LFUNC:RB, CARG1		// BC_CALLT_Z wants both forms: CARG1 tagged
+  |  clear_field RB		// (it is stored into FRAME_FUNC), RB untagged.
   |  b ->BC_CALLT_Z
   |
   |//-- Argument coercion for 'for' statement ------------------------------
@@ -2722,6 +2745,16 @@ static void build_subroutines(BuildCtx *ctx)
   |   stfd f7, CTSTATE->cb.fpr[6]
   |  std r10, CTSTATE->cb.gpr[7]
   |   stfd f8, CTSTATE->cb.fpr[7]
+  |  // ELFv2 passes up to 13 floating-point arguments in f1..f13
+  |  // (CCALL_NARG_FPR), not the 8 of ppc32 SysV, and ->vm_ffi_call already
+  |  // loads all 13 on the outgoing side.
+  |.if not CBFPRBREAK   // negative control: make DASM_XFLAGS="-D CBFPRBREAK"
+  |   stfd f9, CTSTATE->cb.fpr[8]
+  |   stfd f10, CTSTATE->cb.fpr[9]
+  |   stfd f11, CTSTATE->cb.fpr[10]
+  |   stfd f12, CTSTATE->cb.fpr[11]
+  |   stfd f13, CTSTATE->cb.fpr[12]
+  |.endif
   |  // Incoming stack args start at the ELFv2 parameter save area, which is
   |  // entry_sp+96 (32 byte linkage area + 8*8 save slots for r3-r10).
   |  // NB: +8 is the ppc32 SysV offset and is wrong here. Cross-check against
@@ -3359,8 +3392,12 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_next1
     |  li TISNUM, LJ_TISNUM
     |  set_oper_type TISNUM, TISNUM
+    |.if INTCANONBREAK
     |  clear_field CARG1
-    |  add CARG1, CARG1, TISNUM
+    |.else
+    |  clrldi CARG1, CARG1, 32		// int payload is 32 bits (see
+    |.endif
+    |  add CARG1, CARG1, TISNUM		// add_oper_type)
     |  stdux CARG1, RA, BASE
     |2:
     |  ins_next2
@@ -3540,7 +3577,11 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // RA = dst*8, RD = int16_literal*8
     |  srdi RD, RD, 3
     |  extsh RD, RD			// extend sign for negative numbers
+    |.if INTCANONBREAK
     |  clear_field RD
+    |.else
+    |  clrldi RD, RD, 32			// int payload is 32 bits
+    |.endif
     |  ins_next1
     |   add TMP0, RD, TISNUM
     |   stdx TMP0, RA, BASE
@@ -4160,6 +4201,15 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // RA = base*8, (RB = 0,) RC = (nargs+1)*8
     |  ldux TMP0, RA, BASE
     |   ld LFUNC:RB, 0(RA)
+    |  // CARG1 keeps the *tagged* function TValue: under GC64 the tag and the
+    |  // pointer share one word, so the untagged LFUNC:RB that the rest of
+    |  // this handler needs must not be the thing stored into the callee's
+    |  // FRAME_FUNC slot.  That slot is an ordinary TValue: gc_traverse_thread
+    |  // marks it by its type tag (gc_traverse_frames does not mark fn under
+    |  // FR2), and the trace recorder reads its itype.  ppc32 got away with
+    |  // storing the raw pointer because there the tag is a separate word that
+    |  // the store leaves alone.  arm64 keeps the tagged word the same way.
+    |   mr CARG1, LFUNC:RB
     |   clear_field RB
     |    subi NARGS8:RC, NARGS8:RC, 8
     |    ld TMP1, FRAME_PC(BASE)
@@ -4173,7 +4223,11 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |    cmpldi cr1, NARGS8:RC, 0
     |  bne >7
     |1:
-    |  std LFUNC:RB, FRAME_FUNC(BASE)	// Copy function down, but keep PC.
+    |.if CALLTTAGBREAK   // negative control: make DASM_XFLAGS="-D CALLTTAGBREAK"
+    |  std LFUNC:RB, FRAME_FUNC(BASE)
+    |.else
+    |  std CARG1, FRAME_FUNC(BASE)	// Copy function down (tagged), keep PC.
+    |.endif
     |  li TMP2, 0
     |   cmpldi cr7, TMP3, 1		// (> FF_C) Calling a fast function?
     |    beq cr1, >3
@@ -4792,7 +4846,21 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ld TMP2, L->maxstack
     |   add TMP1, BASE, RC
     |  add RA, RA, RC
-    |   std LFUNC:RB, 0(TMP1)		// Store (untagged) copy of LFUNC.
+    |  // The copy of LFUNC in the relocated vararg frame is an ordinary
+    |  // TValue: gc_traverse_thread() marks it by its type tag (under FR2
+    |  // gc_traverse_frames() does not mark the function itself) and the
+    |  // recorder reads its itype.  ppc32 could store the bare pointer
+    |  // because the type word there is a separate word; under GC64 they are
+    |  // one word, so the tag has to be put back -- arm64 does the same
+    |  // (`movn TMP0, #~LJ_TFUNC; add ..., lsl #47').
+    |.if CALLTTAGBREAK   // negative control, as for BC_CALLT
+    |   std LFUNC:RB, 0(TMP1)
+    |.else
+    |   li TMP0, LJ_TFUNC
+    |   set_oper_type TMP0, TMP0
+    |   or TMP0, RB, TMP0
+    |   std TMP0, 0(TMP1)		// Store (tagged) copy of LFUNC.
+    |.endif
     |   addi TMP3, RC, 16+FRAME_VARG
     |    ld KBASE, -4+PC2PROTO(k)(PC)
     |  cmpld RA, TMP2
@@ -4924,13 +4992,14 @@ static void emit_asm_debug(BuildCtx *ctx)
 	/* DW_CFA_offset (TOC) */
 	"\t.byte 0x82\n\t.uleb128 %d\n",
 
-	fcofs, CFRAME_SIZE, 16/-8, (24-400)/-8);
+	fcofs, CFRAME_SIZE, 16/-8, (24-CFRAME_SIZE)/-8);
     for (i = 14; i <= 31; i++)
       fprintf(ctx->fp,
 	"\t.byte %d\n\t.uleb128 %d\n"	/* DW_CFA_offset from r14 to r31 */
 	"\t.byte %d\n\t.uleb128 %d\n",	/* DW_CFA_offset from f14 to f31 */
 	// SAVE_GPR_ SAVE_FPR_
-	0x80+i, (112-400)/-8 + 14-i, 0x80+32+i, (256-400)/-8 + 14-i);
+	0x80+i, (112-CFRAME_SIZE)/-8 + 14-i,
+	0x80+32+i, (256-CFRAME_SIZE)/-8 + 14-i);
 
     fprintf(ctx->fp,
 	"\t.align 3\n"
@@ -4994,12 +5063,13 @@ static void emit_asm_debug(BuildCtx *ctx)
 	"\t.byte 0xe\n\t.uleb128 %d\n"
 	"\t.byte 0x11\n\t.uleb128 65\n\t.sleb128 %d\n"
 	"\t.byte 0x82\n\t.uleb128 %d\n",
-	fcofs, CFRAME_SIZE, 16/-8, (24-400)/-8);
+	fcofs, CFRAME_SIZE, 16/-8, (24-CFRAME_SIZE)/-8);
     for (i = 14; i <= 31; i++)
       fprintf(ctx->fp,
 	"\t.byte %d\n\t.uleb128 %d\n"
 	"\t.byte %d\n\t.uleb128 %d\n",
-	0x80+i, (112-400)/-8 + 14-i, 0x80+32+i, (256-400)/-8 + 14-i);
+	0x80+i, (112-CFRAME_SIZE)/-8 + 14-i,
+	0x80+32+i, (256-CFRAME_SIZE)/-8 + 14-i);
     fprintf(ctx->fp,
 	"\t.align 3\n"
 	".LEFDE2:\n\n");

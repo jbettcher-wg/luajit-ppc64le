@@ -220,13 +220,18 @@ enum { LJ_CONT_TAILCALL, LJ_CONT_FFI_CALLBACK };  /* Special continuations. */
 #define CFRAME_SIZE		400
 #define CFRAME_SHIFT_MULTRES	3
 #elif LJ_ARCH_PPC64
-#define CFRAME_OFS_ERRF         88
-#define CFRAME_OFS_NRES         80
-#define CFRAME_OFS_L            72
-#define CFRAME_OFS_PC           64
-#define CFRAME_OFS_MULTRES      56
-#define CFRAME_OFS_PREV         48
-#define CFRAME_SIZE             400
+/* ELFv2: 32..95 of the frame is the callee parameter save area and is
+** callee-scratch, so the C frame record must not live there -- a JIT trace
+** with spadjust == 0 runs on this frame and may call a variadic C function.
+** Must match with vm_ppc64.dasc.
+*/
+#define CFRAME_OFS_ERRF         456
+#define CFRAME_OFS_NRES         448
+#define CFRAME_OFS_L            440
+#define CFRAME_OFS_PC           432
+#define CFRAME_OFS_MULTRES      424
+#define CFRAME_OFS_PREV         416
+#define CFRAME_SIZE             464
 #define CFRAME_SHIFT_MULTRES    3
 #else
 #define CFRAME_OFS_ERRF		48

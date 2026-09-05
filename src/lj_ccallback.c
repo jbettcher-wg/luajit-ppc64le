@@ -507,6 +507,35 @@ void lj_ccallback_mcode_free(CTState *cts)
 #define CALLBACK_HANDLE_REGARG \
   CALLBACK_HANDLE_GPR \
   UNUSED(isfp);
+#elif LJ_ARCH_PPC64
+#ifdef LJ_TEST_BREAK_CBSLOT
+/* Negative control (Phase 6): drop the parameter-slot reservation an FP
+** argument makes, i.e. the ppc32 rule.  Single variable.
+*/
+#define CALLBACK_PPC64_RESERVE_SLOT
+#else
+#define CALLBACK_PPC64_RESERVE_SLOT \
+  if (ngpr + 1 <= maxgpr) ngpr += 1;  /* Reserve a GPR. */ \
+  else nsp += 1;  /* Or a parameter save area slot. */
+#endif
+/* ELFv2: every argument owns one parameter slot, whatever register class it
+** travels in.  A floating-point argument takes the next FPR (f1..f13) AND
+** consumes its slot, so the GPR of a later integer argument is the one that
+** matches its own slot -- exactly the rule lj_ccall.c already applies in the
+** outgoing direction (CCALL_HANDLE_REGARG there).  Without the reservation
+** the callback reads (double, int64_t) out of r3 instead of r4.
+*/
+#define CALLBACK_HANDLE_REGARG \
+  if (isfp) { \
+    if (nfpr + 1 <= CCALL_NARG_FPR) { \
+      sp = &cts->cb.fpr[nfpr++]; \
+      cta = ctype_get(cts, CTID_DOUBLE);  /* FPRs always hold doubles. */ \
+      CALLBACK_PPC64_RESERVE_SLOT \
+      goto done; \
+    } \
+  } else {  /* Try to pass argument in GPRs. */ \
+    CALLBACK_HANDLE_GPR \
+  }
 #else
 #define CALLBACK_HANDLE_REGARG \
   if (isfp) { \
