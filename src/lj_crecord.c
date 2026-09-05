@@ -1138,6 +1138,8 @@ static TRef crec_call_args(jit_State *J, RecordFFData *rd,
     ngpr = 2;
 #elif LJ_TARGET_ARM64 && LJ_TARGET_OSX
   int ngpr = CCALL_NARG_GPR;
+#elif LJ_ARCH_PPC64
+  int vamark = 0;  /* ELFv2: variadic FP args go in GPRs, fixed ones in FPRs. */
 #endif
 
   /* Skip initial attributes. */
@@ -1166,6 +1168,13 @@ static TRef crec_call_args(jit_State *J, RecordFFData *rd,
 #if LJ_TARGET_ARM64 && LJ_TARGET_OSX
       if (ngpr >= 0) {
 	ngpr = -1;
+	args[n++] = TREF_NIL;  /* Marker for start of varargs. */
+	if (n >= CCI_NARGS_MAX)
+	  lj_trace_err(J, LJ_TRERR_NYICALL);
+      }
+#elif LJ_ARCH_PPC64
+      if (!vamark) {  /* asm_gencall() switches FP args to GPRs from here. */
+	vamark = 1;
 	args[n++] = TREF_NIL;  /* Marker for start of varargs. */
 	if (n >= CCI_NARGS_MAX)
 	  lj_trace_err(J, LJ_TRERR_NYICALL);

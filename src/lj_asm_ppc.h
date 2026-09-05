@@ -96,8 +96,7 @@ static void asm_exitstub_setup(ASMState *as, ExitNo nexits)
     *--mxp = PPCI_MFLR | PPCF_T(RID_TMP);
     *--mxp = PPCI_MTCTR | PPCF_T(RID_TMP);
 #if LJ_ARCH_PPC64
-    lj_assertA((jglofs(as, &as->J->k64[LJ_K64_VM_EXIT_HANDLER]) & 3) == 0,
-	       "unaligned DS-form displacement");
+    emit_guard(as, (jglofs(as, &as->J->k64[LJ_K64_VM_EXIT_HANDLER]) & 3) == 0);
     *--mxp = PPCI_LD | PPCF_T(RID_TMP) | PPCF_A(RID_JGL) |
 	     jglofs(as, &as->J->k64[LJ_K64_VM_EXIT_HANDLER]);
 #else
@@ -305,12 +304,101 @@ static int asm_fusemadd(ASMState *as, IRIns *ir, PPCIns pi, PPCIns pir)
 
 /* -- Calls --------------------------------------------------------------- */
 
+#if LJ_ARCH_PPC64
+/* An ASMREF_L/TMP1/TMP2 argument holds a pointer the handler put there;
+** only real IR refs (constants and instructions) carry an IR width.
+*/
+#define asm_isasmref(ref)	((ref) >= ASMREF_TMP1 && (ref) <= ASMREF_L)
+
+/* Generate a call to a C function: ELFv2 argument marshalling.
+**
+** Every argument, GPR- or FPR-class, occupies one doubleword slot of the
+** parameter list: slots 0..7 are r3..r10, slot k >= 8 is at 96+8*(k-8)(sp)
+** (SPS_FIRST), i.e. above the 96-byte header whose bytes 32..95 are the
+** callee-scratch parameter save area (R8). A non-variadic FP argument goes
+** to the next free FPR f1..f13 and still consumes its slot; nothing is
+** stored to the slot. Arguments after the recorder's varargs marker (a 0
+** ref planted by lj_crecord.c) are variadic: FP values travel in the GPR
+** slot as their double image (mfvsrd), exactly what lj_ccall.c's per-arg
+** isva does and what GCC 16 emits for a variadic call site.
+**
+** Width discipline (D3): the callee does not re-extend sub-doubleword
+** integers (GCC 16 emits a bare blr for long f(int a){return a;}), so every
+** 32-bit IR value is sign- or zero-extended here, in the argument register
+** itself, or into r0 before a std to a stack slot.
+*/
+static void asm_gencall(ASMState *as, const CCallInfo *ci, IRRef *args)
+{
+  uint32_t n, nargs = CCI_XNARGS(ci);
+  int32_t ofs = sps_scale(SPS_FIRST);
+  Reg gpr = REGARG_FIRSTGPR, fpr = REGARG_FIRSTFPR;
+  int isva = 0;
+  if ((void *)ci->func)
+    emit_call(as, (void *)ci->func);
+  for (n = 0; n < nargs; n++) {  /* Setup args. */
+    IRRef ref = args[n];
+    IRIns *ir;
+    if (!ref) {  /* Marker for the start of the variadic part. */
+      isva = 1;
+      continue;
+    }
+    ir = IR(ref);
+    if (irt_isfp(ir->t) && !isva) {
+      if (fpr <= REGARG_LASTFPR) {
+	lj_assertA(rset_test(as->freeset, fpr),
+		   "reg %d not free", fpr);  /* Already evicted. */
+	ra_leftov(as, fpr, ref);
+	fpr++;
+	if (gpr <= REGARG_LASTGPR) gpr++; else ofs += 8;  /* Slot consumed. */
+      } else {  /* 14th+ FP argument: its slot is on the stack by then. */
+	Reg r = ra_alloc1(as, ref, RSET_FPR);
+	lj_assertA(gpr > REGARG_LASTGPR, "FP arg 14+ in GPR slot range");
+	emit_spstore(as, ir, r, ofs);
+	ofs += 8;
+      }
+    } else if (irt_isfp(ir->t)) {  /* Variadic FP argument: GPR image. */
+      Reg r;
+      lj_assertA(irt_isnum(ir->t), "vararg float not promoted to double");
+      if (gpr <= REGARG_LASTGPR) {
+	RegSet of = as->freeset;
+	lj_assertA(rset_test(as->freeset, gpr), "reg %d not free", gpr);
+	/* Protect the argument GPRs from being used for rematerialization. */
+	as->freeset &= ~RSET_RANGE(REGARG_FIRSTGPR, REGARG_LASTGPR+1);
+	r = ra_alloc1(as, ref, RSET_FPR);
+	as->freeset |= (of & RSET_RANGE(REGARG_FIRSTGPR, REGARG_LASTGPR+1));
+	emit_tab(as, PPCI_MFVSRD, (r & 31), gpr, 0);
+	gpr++;
+      } else {
+	r = ra_alloc1(as, ref, RSET_FPR);
+	emit_fai(as, PPCI_STFD, r, RID_SP, ofs);
+	ofs += 8;
+      }
+    } else {  /* GPR argument. */
+      int wide = asm_isasmref(ref) || irt_is64(ir->t);
+      if (gpr <= REGARG_LASTGPR) {
+	lj_assertA(rset_test(as->freeset, gpr),
+		   "reg %d not free", gpr);  /* Already evicted. */
+	if (!wide) emit_widen(as, ir->t, gpr, gpr);  /* After the move. */
+	ra_leftov(as, gpr, ref);
+	gpr++;
+      } else {
+	Reg r = ra_alloc1(as, ref, RSET_GPR);
+	if (wide) {
+	  emit_tai(as, PPCI_STD, r, RID_SP, ofs);
+	} else {
+	  emit_tai(as, PPCI_STD, RID_TMP, RID_SP, ofs);
+	  emit_widen(as, ir->t, RID_TMP, r);
+	}
+	ofs += 8;
+      }
+    }
+    checkmclim(as);
+  }
+}
+#else
 /* Generate a call to a C function. */
 static void asm_gencall(ASMState *as, const CCallInfo *ci, IRRef *args)
 {
-#if LJ_ARCH_PPC64
-  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
-#endif
   uint32_t n, nargs = CCI_XNARGS(ci);
   int32_t ofs = 8;
   Reg gpr = REGARG_FIRSTGPR;
@@ -363,6 +451,7 @@ static void asm_gencall(ASMState *as, const CCallInfo *ci, IRRef *args)
     emit_tab(as, fpr == REGARG_FIRSTFPR ? PPCI_CRXOR : PPCI_CREQV, 6, 6, 6);
 #endif
 }
+#endif
 
 /* Setup result reg/sp for call. Evict scratch regs. */
 static void asm_setupresult(ASMState *as, IRIns *ir, const CCallInfo *ci)
@@ -382,6 +471,18 @@ static void asm_setupresult(ASMState *as, IRIns *ir, const CCallInfo *ci)
     lj_assertA(!irt_ispri(ir->t), "PRI dest");
     if (!LJ_SOFTFP && irt_isfp(ir->t)) {
       if ((ci->flags & CCI_CASTU64)) {
+#if LJ_ARCH_PPC64
+	/* u64 result in r3 reinterpreted as a double: mtvsrd, no memory. */
+	int32_t ofs = sps_scale(ir->s);
+	Reg dest = ir->r;
+	if (ra_hasreg(dest)) {
+	  ra_free(as, dest);
+	  ra_modified(as, dest);
+	  emit_tab(as, PPCI_MTVSRD, (dest & 31), RID_RET, 0);
+	}
+	if (ofs)
+	  emit_tai(as, PPCI_STD, RID_RET, RID_SP, ofs);
+#else
 	/* Use spill slot or temp slots. */
 	int32_t ofs = ir->s ? sps_scale(ir->s) : SPOFS_TMP;
 	Reg dest = ir->r;
@@ -392,6 +493,7 @@ static void asm_setupresult(ASMState *as, IRIns *ir, const CCallInfo *ci)
 	}
 	emit_tai(as, PPCI_STW, RID_RETHI, RID_SP, ofs);
 	emit_tai(as, PPCI_STW, RID_RETLO, RID_SP, ofs+4);
+#endif
       } else {
 	ra_destreg(as, ir, RID_FPRET);
       }
@@ -415,7 +517,20 @@ static void asm_callx(ASMState *as, IRIns *ir)
   func = ir->op2; irf = IR(func);
   if (irf->o == IR_CARG) { func = irf->op1; irf = IR(func); }
   if (irref_isk(func)) {  /* Call to constant address. */
-    ci.func = (ASMFunction)(void *)(intptr_t)(irf->i);
+    ci.func = (ASMFunction)(void *)get_kval(as, func);
+#if LJ_ARCH_PPC64
+  } else {  /* Indirect call: the callee address must be in r12 (D2). */
+    Reg r = ra_alloc1(as, func, RID2RSET(RID_CFUNCADDR));
+    MCode *p = as->mcp;
+    *--p = PPCI_LD | PPCF_T(RID_SYS1) | PPCF_A(RID_SP) | 24;
+    *--p = PPCI_BCTRL;
+    *--p = PPCI_MTCTR | PPCF_T(RID_CFUNCADDR);
+    if (r != RID_CFUNCADDR)  /* Value already lives elsewhere: r12 is scratch. */
+      *--p = PPCI_MR | PPCF_T(r) | PPCF_A(RID_CFUNCADDR) | PPCF_B(r);
+    as->mcp = p;
+    ci.func = (ASMFunction)(void *)0;
+  }
+#else
   } else {  /* Need a non-argument register for indirect calls. */
     RegSet allow = RSET_GPR & ~RSET_RANGE(RID_R0, REGARG_LASTGPR+1);
     Reg freg = ra_alloc1(as, func, allow);
@@ -423,6 +538,7 @@ static void asm_callx(ASMState *as, IRIns *ir)
     *--as->mcp = PPCI_MTCTR | PPCF_T(freg);
     ci.func = (ASMFunction)(void *)0;
   }
+#endif
   asm_gencall(as, &ci, args);
 }
 
@@ -2089,6 +2205,23 @@ static void asm_stack_check(ASMState *as, BCReg topslot,
   tmp = allow ? rset_pickbot(allow) :
 		(pbase == RID_RETHI ? RID_RETLO : RID_RETHI);
   emit_condbranch(as, PPCI_BC, CC_LT, asm_exitstub_addr(as, exitno));
+#if LJ_ARCH_PPC64
+  /* 64-bit pointers throughout; the scratch slot is the LR save doubleword
+  ** at 16(sp), dead between calls (SPOFS_TMPW, see lj_target_ppc.h).
+  */
+  if (allow == RSET_EMPTY)  /* Restore temp. register. */
+    emit_tai(as, PPCI_LD, tmp, RID_SP, SPOFS_TMPW);
+  else
+    ra_modified(as, tmp);
+  emit_ai(as, PPCI_CMPLDI, RID_TMP, (int32_t)(8*topslot));
+  emit_tab(as, PPCI_SUBF, RID_TMP, pbase, tmp);
+  emit_tai(as, PPCI_LD, tmp, tmp, offsetof(lua_State, maxstack));
+  if (pbase == RID_TMP)
+    emit_getgl(as, RID_TMP, jit_base);
+  emit_getgl(as, tmp, cur_L);
+  if (allow == RSET_EMPTY)  /* Spill temp. register. */
+    emit_tai(as, PPCI_STD, tmp, RID_SP, SPOFS_TMPW);
+#else
   if (allow == RSET_EMPTY)  /* Restore temp. register. */
     emit_tai(as, PPCI_LWZ, tmp, RID_SP, SPOFS_TMPW);
   else
@@ -2101,6 +2234,7 @@ static void asm_stack_check(ASMState *as, BCReg topslot,
   emit_getgl(as, tmp, cur_L);
   if (allow == RSET_EMPTY)  /* Spill temp. register. */
     emit_tai(as, PPCI_STW, tmp, RID_SP, SPOFS_TMPW);
+#endif
 }
 
 /* Restore Lua stack from on-trace state. */
@@ -2109,6 +2243,13 @@ static void asm_stack_restore(ASMState *as, SnapShot *snap)
   SnapEntry *map = &as->T->snapmap[snap->mapofs];
   SnapEntry *flinks = &as->T->snapmap[snap_nextofs(as->T, snap)-1];
   MSize n, nent = snap->nent;
+#if LJ_ARCH_PPC64
+  /* Phase 3: the stores below are ppc32 (32-bit it/gcr pairs). Until the
+  ** GC64 version lands, a snapshot with entries cannot be restored; an
+  ** empty one emits nothing and is fine.
+  */
+  if (nent) asm_nyi64_gate(as);
+#endif
   /* Store the value of all modified slots to the Lua stack. */
   for (n = 0; n < nent; n++) {
     SnapEntry sn = map[n];
@@ -2170,9 +2311,6 @@ static void asm_stack_restore(ASMState *as, SnapShot *snap)
 /* Check GC threshold and do one or more GC steps. */
 static void asm_gc_check(ASMState *as)
 {
-#if LJ_ARCH_PPC64
-  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
-#endif
   const CCallInfo *ci = &lj_ir_callinfo[IRCALL_lj_gc_step_jit];
   IRRef args[2];
   MCLabel l_end;
@@ -2191,7 +2329,7 @@ static void asm_gc_check(ASMState *as)
   emit_loadi(as, tmp, as->gcsteps);
   /* Jump around GC step if GC total < GC threshold. */
   emit_condbranch(as, PPCI_BC|PPCF_Y, CC_LT, l_end);
-  emit_ab(as, PPCI_CMPLW, RID_TMP, tmp);
+  emit_ab(as, LJ_GC64 ? PPCI_CMPLD : PPCI_CMPLW, RID_TMP, tmp);  /* GCSize. */
   emit_getgl(as, tmp, gc.threshold);
   emit_getgl(as, RID_TMP, gc.total);
   as->gcsteps = 0;
@@ -2224,9 +2362,6 @@ static void asm_loop_tail_fixup(ASMState *as)
 /* Coalesce BASE register for a root trace. */
 static void asm_head_root_base(ASMState *as)
 {
-#if LJ_ARCH_PPC64
-  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
-#endif
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
   if (ra_hasreg(r)) {
@@ -2241,9 +2376,6 @@ static void asm_head_root_base(ASMState *as)
 /* Coalesce BASE register for a side trace. */
 static Reg asm_head_side_base(ASMState *as, IRIns *irp)
 {
-#if LJ_ARCH_PPC64
-  asm_nyi64_gate(as);  /* Phase 1: no code emitter yet. */
-#endif
   IRIns *ir = IR(REF_BASE);
   Reg r = ir->r;
   if (ra_hasreg(r)) {
@@ -2273,7 +2405,15 @@ static void asm_tail_fixup(ASMState *as, TraceNo lnk)
   if (spadj) {  /* Emit stack adjustment. */
     lj_assertA(checki16(CFRAME_SIZE+spadj), "stack adjustment out of range");
     *mcp++ = PPCI_ADDI | PPCF_T(RID_TMP) | PPCF_A(RID_SP) | (CFRAME_SIZE+spadj);
+#if LJ_ARCH_PPC64
+    /* Pop the trace frame; the interpreter frame's 24(sp) already holds
+    ** the TOC (SAVE_TOC), so no reload is needed on this edge (D2).
+    */
+    emit_guard(as, (spadj & 3) == 0);
+    *mcp++ = PPCI_STDU | PPCF_T(RID_TMP) | PPCF_A(RID_SP) | spadj;
+#else
     *mcp++ = PPCI_STWU | PPCF_T(RID_TMP) | PPCF_A(RID_SP) | spadj;
+#endif
   }
   /* Emit exit branch. */
   if ((((target - (uintptr_t)mcp) + 0x02000000u) >> 26) == 0) {
@@ -2318,6 +2458,18 @@ static Reg asm_setup_call_slots(ASMState *as, IRIns *ir, const CCallInfo *ci)
 {
   IRRef args[CCI_NARGS_MAX*2];
   uint32_t i, nargs = CCI_XNARGS(ci);
+#if LJ_ARCH_PPC64
+  /* ELFv2: every argument takes a doubleword slot, FP or not; slots 8+
+  ** are on the stack from SPS_FIRST (byte 96). The varargs marker (0 ref)
+  ** takes none.
+  */
+  int nslots = SPS_FIRST, ngpr = REGARG_NUMGPR;
+  asm_collectargs(as, ir, ci, args);
+  for (i = 0; i < nargs; i++)
+    if (args[i]) {
+      if (ngpr > 0) ngpr--; else nslots += 2;
+    }
+#else
   int nslots = 2, ngpr = REGARG_NUMGPR, nfpr = REGARG_NUMFPR;
   asm_collectargs(as, ir, ci, args);
   for (i = 0; i < nargs; i++)
@@ -2326,6 +2478,7 @@ static Reg asm_setup_call_slots(ASMState *as, IRIns *ir, const CCallInfo *ci)
     } else {
       if (ngpr > 0) ngpr--; else nslots++;
     }
+#endif
   if (nslots > as->evenspill)  /* Leave room for args in stack slots. */
     as->evenspill = nslots;
   return (!LJ_SOFTFP && irt_isfp(ir->t)) ? REGSP_HINT(RID_FPRET) :
@@ -2395,7 +2548,13 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
 }
 
 
-/* -- PPC64 phase-1 per-handler redirection (generated) ------------------- */
+/* -- PPC64 per-handler redirection (generated) --------------------------- */
+
+/* Handlers whose 64-bit version has landed are listed here and excluded
+** by tests/lib/lj_ppc64_nyi_gen.py; everything else lj_asm.c can reach is
+** redirected to asm_nyi64 below.
+*/
+/* PPC64_CONVERTED: asm_callx */
 
 #if LJ_ARCH_PPC64
 /* BEGIN GENERATED: lj_ppc64_nyi_gen.py -- do not edit by hand. */
@@ -2431,8 +2590,6 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
 #define asm_bswap(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bswap)
 #undef asm_bxor
 #define asm_bxor(as, ir)	asm_nyi64((as), (ir), (const void *)asm_bitop)
-#undef asm_callx
-#define asm_callx(as, ir)	asm_nyi64((as), (ir), (const void *)asm_callx)
 #undef asm_cnew
 #define asm_cnew(as, ir)	asm_nyi64((as), (ir), (const void *)asm_cnew)
 #undef asm_comp

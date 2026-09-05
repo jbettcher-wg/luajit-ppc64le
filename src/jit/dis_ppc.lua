@@ -417,10 +417,22 @@ local function unknown(ctx)
 end
 
 -- Disassemble a single instruction.
-local function disass_ins(ctx)
+local function get_be(ctx)
   local pos = ctx.pos
   local b0, b1, b2, b3 = byte(ctx.code, pos+1, pos+4)
-  local op = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+end
+
+local function get_le(ctx)
+  local pos = ctx.pos
+  local b0, b1, b2, b3 = byte(ctx.code, pos+1, pos+4)
+  return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+end
+
+local function disass_ins(ctx)
+  local pos = ctx.pos
+  local op = ctx:get()
+  local b0 = op >> 24
   local operands = {}
   local last = nil
   local rs = 21
@@ -567,12 +579,23 @@ local function create(code, addr, out)
   ctx.symtab = {}
   ctx.disass = disass_block
   ctx.hexdump = 8
+  ctx.get = get_be
+  return ctx
+end
+
+local function create_el(code, addr, out)
+  local ctx = create(code, addr, out)
+  ctx.get = get_le
   return ctx
 end
 
 -- Simple API: disassemble code (a string) at address and output via out.
 local function disass(code, addr, out)
   create(code, addr, out):disass()
+end
+
+local function disass_el(code, addr, out)
+  create_el(code, addr, out):disass()
 end
 
 -- Return register name for RID.
@@ -584,7 +607,9 @@ end
 -- Public module functions.
 return {
   create = create,
+  create_el = create_el,
   disass = disass,
+  disass_el = disass_el,
   regname = regname
 }
 

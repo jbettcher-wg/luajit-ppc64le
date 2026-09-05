@@ -40,6 +40,9 @@ enum {
   RID_DISPATCH = RID_R17,	/* Interpreter DISPATCH table. */
   RID_LREG = RID_R18,		/* Interpreter L. */
   RID_JGL = RID_R31,		/* On-trace: global_State + 32768. */
+#if LJ_ARCH_PPC64
+  RID_CFUNCADDR = RID_R12,	/* ELFv2: callee address on entry (D2). */
+#endif
 
   /* Register ranges [min, max) and number of registers. */
   RID_MIN_GPR = RID_R0,
@@ -326,6 +329,10 @@ typedef enum PPCIns {
   PPCI_MTVSRWA = 0x7c0001a6,
   PPCI_MTVSRWZ = 0x7c0001e6,
   PPCI_MFVSRWZ = 0x7c0000e6,
+
+  PPCI_ISEL = 0x7c00001e,	/* BC is an absolute 5-bit CR bit index. */
+  PPCI_LXV = 0xf4000001,	/* ISA 3.0, DQ-form: displacement multiple of 16. */
+  PPCI_STXV = 0xf4000005,	/* ISA 3.0, DQ-form. */
 
   PPCI_MFXER = 0x7c0102a6,
   PPCI_MTXER = 0x7c0103a6,
